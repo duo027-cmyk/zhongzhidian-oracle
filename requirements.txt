@@ -1,0 +1,4 @@
+# Dependencies for the project
+
+# Add your project's dependencies below
+
