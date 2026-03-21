@@ -11,6 +11,8 @@ Covers the fixes introduced in the "請針對問題優化修正到完美" PR:
   7. _update_actor_critic refactor returns float loss
   8. SelfReviewModule routing and multi-turn context
   9. Agent.chat() auto-saves conversation history
+ 10. WikipediaAdapter — encyclopedic fallback (mocked network)
+ 11. KnowledgeModule Wikipedia Tier 2 fallback
 """
 
 import hashlib
@@ -19,6 +21,7 @@ import os
 import sys
 import types
 import tempfile
+from unittest.mock import patch, MagicMock
 
 import pytest
 import numpy as np
@@ -415,3 +418,192 @@ class TestAgentChatAutoSave:
         assert len(history) >= 2, (
             f"Second agent should have restored history but got {len(history)} entries"
         )
+
+
+# ============================================================================
+# 10. WIKIPEDIA ADAPTER
+# ============================================================================
+
+def _make_mock_urlopen(search_titles: list, extract: str):
+    """Return a context-manager-compatible mock for urllib.request.urlopen.
+
+    First call → OpenSearch JSON response with *search_titles*.
+    Second call → page/summary JSON response with *extract*.
+    """
+    import io
+    call_count = {"n": 0}
+
+    class _FakeResponse:
+        def __init__(self, body: bytes):
+            self._body = body
+        def read(self):
+            return self._body
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    def _urlopen(req, timeout=None):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # OpenSearch
+            data = ["query", search_titles, ["desc"], ["url"]]
+            return _FakeResponse(json.dumps(data).encode())
+        else:
+            # page/summary
+            data = {"extract": extract, "title": search_titles[0] if search_titles else ""}
+            return _FakeResponse(json.dumps(data).encode())
+
+    return _urlopen
+
+
+class TestWikipediaAdapter:
+    def test_search_returns_summary(self):
+        """Happy path: valid OpenSearch + summary fetch returns a string."""
+        adapter = dsv.WikipediaAdapter()
+        mock_open = _make_mock_urlopen(["台灣"], "台灣，正式名稱中華民國，位於東亞。")
+        with patch("urllib.request.urlopen", side_effect=mock_open):
+            result = adapter.search("台灣")
+        assert result is not None
+        assert "台灣" in result
+
+    def test_search_uses_lru_cache(self):
+        """A repeated query must not trigger a second network call."""
+        adapter = dsv.WikipediaAdapter()
+        call_log = []
+
+        import io
+        class _Resp:
+            def __init__(self, n):
+                self._n = n
+            def read(self):
+                if self._n == 1:
+                    return json.dumps(["q", ["台灣"], [], []]).encode()
+                return json.dumps({"extract": "Taiwan is an island.", "title": "台灣"}).encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        def _open(req, timeout=None):
+            call_log.append(1)
+            n = len(call_log)
+            return _Resp(n)
+
+        with patch("urllib.request.urlopen", side_effect=_open):
+            adapter.search("台灣")
+            adapter.search("台灣")   # second call — must hit cache
+
+        # OpenSearch + summary = 2 calls; if cache works, total stays at 2
+        assert len(call_log) == 2
+
+    def test_search_returns_none_when_disabled(self):
+        """DREAMER_WIKI_ENABLED=false → search always returns None."""
+        adapter = dsv.WikipediaAdapter()
+        adapter.enabled = False
+        with patch("urllib.request.urlopen") as mock_open:
+            result = adapter.search("anything")
+        mock_open.assert_not_called()
+        assert result is None
+
+    def test_search_returns_none_on_network_error(self):
+        """Network failure is swallowed; returns None without raising."""
+        adapter = dsv.WikipediaAdapter()
+        with patch("urllib.request.urlopen", side_effect=OSError("no network")):
+            result = adapter.search("量子力學")
+        assert result is None
+
+    def test_search_returns_none_when_opensearch_finds_nothing(self):
+        """Empty title list from OpenSearch → returns None."""
+        import io
+        class _EmptyResp:
+            def read(self): return json.dumps(["q", [], [], []]).encode()
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+
+        adapter = dsv.WikipediaAdapter()
+        with patch("urllib.request.urlopen", return_value=_EmptyResp()):
+            result = adapter.search("zzz_nonexistent_topic_zzz")
+        assert result is None
+
+    def test_extract_truncated_at_500_chars(self):
+        """Long extracts must be truncated to _EXTRACT_MAX characters + ellipsis."""
+        long_extract = "A" * 600
+        mock_open = _make_mock_urlopen(["LongArticle"], long_extract)
+        adapter = dsv.WikipediaAdapter()
+        with patch("urllib.request.urlopen", side_effect=mock_open):
+            result = adapter.search("long")
+        assert result is not None
+        assert result.endswith("…")
+        # The prefix "[維基百科 / Wikipedia — LongArticle] " is extra
+        core = result.split("] ", 1)[1]
+        assert len(core) <= dsv.WikipediaAdapter._EXTRACT_MAX + 1  # +1 for "…"
+
+    def test_env_var_wiki_enabled_false(self, monkeypatch):
+        """Module-level _WIKI_ENABLED env var disables the adapter at init."""
+        monkeypatch.setattr(dsv, "_WIKI_ENABLED", False)
+        adapter = dsv.WikipediaAdapter()
+        assert adapter.enabled is False
+
+    def test_env_var_wiki_lang(self, monkeypatch):
+        """DREAMER_WIKI_LANG env var controls default language."""
+        monkeypatch.setattr(dsv, "_WIKI_LANG", "en")
+        adapter = dsv.WikipediaAdapter()
+        assert adapter.lang == "en"
+
+
+# ============================================================================
+# 11. KNOWLEDGEMODULE WIKIPEDIA TIER 2 FALLBACK
+# ============================================================================
+
+class TestKnowledgeModuleWikipediaFallback:
+    def _agent_with_wiki_mock(self, extract: str = "Mock extract."):
+        """Return an agent whose WikipediaAdapter is pre-configured with a mock."""
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km._wiki = MagicMock(spec=dsv.WikipediaAdapter)
+        km._wiki.search.return_value = f"[維基百科 / Wikipedia — MockTitle] {extract}"
+        return agent, km
+
+    def test_wikipedia_fallback_invoked_on_unknown_question(self):
+        """An unrecognised question must trigger WikipediaAdapter.search()."""
+        agent, km = self._agent_with_wiki_mock("Mock Wikipedia content.")
+        answer = agent.chat("量子電動力學是什麼？")
+        km._wiki.search.assert_called_once()
+        assert "Wikipedia" in answer or "百科" in answer or "Mock" in answer
+
+    def test_wikipedia_result_included_in_answer(self):
+        """Wikipedia fallback text must be present in the returned answer."""
+        agent, km = self._agent_with_wiki_mock("Quantum electrodynamics (QED) stub.")
+        answer = agent.chat("量子電動力學")
+        assert "Quantum" in answer or "Wikipedia" in answer or "百科" in answer
+
+    def test_local_knowledge_takes_priority_over_wikipedia(self):
+        """Known local entries must NOT invoke WikipediaAdapter.search()."""
+        agent, km = self._agent_with_wiki_mock()
+        # "畢氏定理" is a known local entry
+        answer = agent.chat("畢氏定理是什麼？")
+        km._wiki.search.assert_not_called()
+        assert "a² + b²" in answer or "畢氏" in answer
+
+    def test_wikipedia_disabled_gives_no_result_message(self):
+        """When Wikipedia is disabled, fallback to the 'no data' message."""
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km._wiki = MagicMock(spec=dsv.WikipediaAdapter)
+        km._wiki.search.return_value = None  # simulates offline / disabled
+        answer = agent.chat("一個完全不存在的話題XYZZY")
+        assert "無私人知識資料" in answer or "未找到" in answer
+
+    def test_self_review_routes_encyclopedia_component(self):
+        """Asking about '百科' or 'WikipediaAdapter' routes to component_encyclopedia."""
+        agent = make_agent()
+        a = agent.chat("請介紹 WikipediaAdapter 百科知識適配器")
+        assert "Wikipedia" in a or "維基百科" in a or "大英百科" in a or "百科" in a
+        assert agent.conversation.last_topic() == "self_review:component_encyclopedia"
+
+    def test_self_review_britannica_keyword(self):
+        """Asking about 'Britannica' routes to the encyclopedia component."""
+        agent = make_agent()
+        a = agent.chat("你有沒有接入大英百科全書 Britannica？")
+        topic = agent.conversation.last_topic()
+        assert topic == "self_review:component_encyclopedia"
+        assert "Wikipedia" in a or "Britannica" in a or "百科" in a

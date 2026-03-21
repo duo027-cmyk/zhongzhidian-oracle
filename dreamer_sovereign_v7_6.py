@@ -7,6 +7,7 @@ Dreamer Sovereign Edition v7.6 - Sovereign Taiwan Ultimate (Single File)
 - 超兇台灣味拒絕（JSON + 隨機多句）
 - TTS 語音模塊（Piper TTS 離線台灣腔，模型路徑由環境變數 DREAMER_TTS_MODEL 管理）
 - 知識模塊（醫療 + 物理 + 化學 + 數學 13 筆，按需載入 + 因果審核）
+- 百科知識模塊（WikipediaAdapter：以維基百科 REST API 作為大英百科式知識後備，免費開源）
 - 多輪對話記憶（ConversationMemory：根據上一輪對話思考，代詞/指代解析，支援 JSON 持久化）
 - 自我審視模塊（SelfReviewModule：針對代碼架構、優缺點的自我評估）
 - 想像展開（Imagination Rollout）：以世界模型生成虛擬軌跡增強 Actor/Critic 訓練
@@ -14,12 +15,22 @@ Dreamer Sovereign Edition v7.6 - Sovereign Taiwan Ultimate (Single File)
 - 拒絕事件自動記錄進 buffer（永不遺忘）
 - 錯誤處理 + 日誌記錄
 - 零依賴（TTS 需 pip install piper-tts + 下載台灣腔模型）
+
+關於大英百科全書（Encyclopaedia Britannica）：
+  Britannica 為版權商業內容，其 API 需付費授權（developer.eb.com）。
+  本系統採用維基百科（Wikipedia, CC BY-SA 4.0）作為免費開源的百科知識來源，
+  涵蓋範疇相當，無需 API 金鑰，支援離線降級。
+  如持有 Britannica API 授權，可將 WikipediaAdapter._fetch_summary() 替換為
+  對 api.eb.com 的呼叫。
 """
 
 import sys
 import logging
 import subprocess
 import tempfile
+import urllib.request
+import urllib.parse
+import urllib.error
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -78,6 +89,16 @@ _CONVERSATION_PATH: str = os.environ.get(
 
 # TTS model name — override via env var (e.g. export DREAMER_TTS_MODEL=my_model)
 _TTS_MODEL: str = os.environ.get("DREAMER_TTS_MODEL", "tw_taigi_female")
+
+# Wikipedia encyclopedia adapter settings
+# Set DREAMER_WIKI_ENABLED=false to disable online encyclopedic lookups entirely
+_WIKI_ENABLED: bool = os.environ.get("DREAMER_WIKI_ENABLED", "true").lower() == "true"
+# Wikipedia language code: "zh" (Traditional/Simplified Chinese), "en" (English)
+_WIKI_LANG: str = os.environ.get("DREAMER_WIKI_LANG", "zh")
+# HTTP request timeout in seconds for Wikipedia API calls
+_WIKI_TIMEOUT: int = int(os.environ.get("DREAMER_WIKI_TIMEOUT_SEC", "5"))
+# Maximum number of Wikipedia results to hold in the in-process LRU cache
+_WIKI_CACHE_MAX: int = 128
 
 # ────────────────────────────────────────────────
 # 主權驗證
@@ -501,12 +522,147 @@ class TTSModule:
 
 
 # ────────────────────────────────────────────────
+# 百科知識適配器（Wikipedia REST API）
+# ────────────────────────────────────────────────
+
+class WikipediaAdapter:
+    """Encyclopedic knowledge adapter backed by Wikipedia's free public REST API.
+
+    Why Wikipedia instead of Encyclopaedia Britannica?
+    ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    Britannica's content is copyright-protected and its API requires a paid
+    commercial licence (see developer.eb.com).  Wikipedia (CC BY-SA 4.0) is
+    the legally-usable, freely-accessible encyclopedic equivalent: no API key,
+    no download quota, no redistribution restrictions.
+
+    If you hold a valid Britannica API licence, replace ``_fetch_summary``
+    with calls to ``https://api.eb.com/article/search`` using your key — the
+    rest of the integration (caching, fallback, memory persistence) stays the
+    same.
+
+    Usage
+    -----
+    * ``WikipediaAdapter.search(query)`` — returns a UTF-8 summary string or
+      ``None`` when the article cannot be found or the network is unavailable.
+    * Responses are cached in an in-process LRU dict (size ``_WIKI_CACHE_MAX``)
+      so repeated queries skip the network round-trip.
+    * Language priority: ``_WIKI_LANG`` (default ``"zh"``) → English fallback.
+    * All network errors are swallowed and logged at DEBUG level so the caller
+      always gets a clean ``None`` rather than an exception.
+    """
+
+    # Sentence the User-Agent header must match for polite API access
+    _USER_AGENT = (
+        "Dreamer-Sovereign/7.6 "
+        "(https://github.com/duo027-cmyk/zhongzhidian-oracle; educational-bot)"
+    )
+    # Maximum characters returned from an article extract before truncation
+    _EXTRACT_MAX = 500
+
+    def __init__(self) -> None:
+        self.lang: str = _WIKI_LANG
+        self.timeout: int = _WIKI_TIMEOUT
+        self.enabled: bool = _WIKI_ENABLED
+        # LRU cache: key = "{lang}:{query}", value = summary string
+        self._cache: dict = {}
+        self._cache_order: collections.deque = collections.deque(maxlen=_WIKI_CACHE_MAX)
+
+    # ── Public ────────────────────────────────────────────────────────────
+
+    def search(self, query: str) -> str | None:
+        """Return a short encyclopedic summary for *query*, or ``None``.
+
+        Steps:
+        1. Check in-process LRU cache.
+        2. OpenSearch to resolve the best matching article title.
+        3. REST ``page/summary`` endpoint to fetch the extract.
+        4. If the primary language yields no result, try English as fallback.
+        """
+        if not self.enabled:
+            return None
+        cache_key = f"{self.lang}:{query}"
+        if cache_key in self._cache:
+            logger.debug("[WikipediaAdapter] Cache hit: %s", query)
+            return self._cache[cache_key]
+
+        result = self._fetch_summary(query, self.lang)
+        # English fallback when primary language finds nothing
+        if result is None and self.lang != "en":
+            result = self._fetch_summary(query, "en")
+
+        if result:
+            self._put_cache(cache_key, result)
+        return result
+
+    # ── Private ───────────────────────────────────────────────────────────
+
+    def _fetch_summary(self, query: str, lang: str) -> str | None:
+        """Two-step lookup: OpenSearch title → REST page summary."""
+        title = self._opensearch(query, lang)
+        if not title:
+            return None
+        return self._page_summary(title, lang)
+
+    def _opensearch(self, query: str, lang: str) -> str | None:
+        """Use Wikipedia's OpenSearch API to find the canonical article title."""
+        url = (
+            f"https://{lang}.wikipedia.org/w/api.php?"
+            f"action=opensearch"
+            f"&search={urllib.parse.quote(query, safe='')}"
+            f"&limit=1&namespace=0&redirects=resolve&format=json"
+        )
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": self._USER_AGENT})
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            titles: list = data[1]
+            return titles[0] if titles else None
+        except Exception as exc:
+            logger.debug("[WikipediaAdapter] OpenSearch failed (%s): %s", lang, exc)
+            return None
+
+    def _page_summary(self, title: str, lang: str) -> str | None:
+        """Fetch the plain-text extract for *title* via the REST summary endpoint."""
+        url = (
+            f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/"
+            f"{urllib.parse.quote(title, safe='')}"
+        )
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": self._USER_AGENT})
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            extract: str = data.get("extract", "").strip()
+            if not extract:
+                return None
+            if len(extract) > self._EXTRACT_MAX:
+                extract = extract[:self._EXTRACT_MAX] + "…"
+            return f"[維基百科 / Wikipedia — {title}] {extract}"
+        except Exception as exc:
+            logger.debug("[WikipediaAdapter] Summary fetch failed (%s/%s): %s",
+                         lang, title, exc)
+            return None
+
+    def _put_cache(self, key: str, value: str) -> None:
+        """Insert *key*→*value* into the LRU cache, evicting the oldest if full."""
+        if key not in self._cache:
+            # deque with maxlen handles eviction automatically;
+            # we only need to remove the corresponding dict entry.
+            if len(self._cache_order) == _WIKI_CACHE_MAX:
+                oldest = self._cache_order[0]   # will be auto-evicted from deque
+                self._cache.pop(oldest, None)
+            self._cache_order.append(key)
+        self._cache[key] = value
+
+
+# ────────────────────────────────────────────────
 # 知識模塊（醫療 + 物理 + 化學 + 數學，按需載入 + 因果審核）
 # ────────────────────────────────────────────────
 
 class KnowledgeModule:
     def __init__(self, agent):
         self.agent = agent
+        # Encyclopedic fallback: Wikipedia adapter (zero new dependencies)
+        self._wiki = WikipediaAdapter()
         self.knowledge = {
             "醫療": {
                 "缺鈣補鈣": {
@@ -666,7 +822,18 @@ class KnowledgeModule:
                 f"如需更深入說明，請主公告知具體方向。"
             )
         else:
-            answer = "無私人知識資料，請主公提供來源或自行查閱權威機構"
+            # ── Tier 2: Wikipedia encyclopedic fallback ─────────────────────
+            # When local knowledge has no match, consult the free encyclopedic
+            # knowledge base (Wikipedia) as an authoritative secondary source.
+            wiki_result = self._wiki.search(question)
+            if wiki_result:
+                answer = f"[百科知識 · Wikipedia] {wiki_result}"
+                logger.info("[KnowledgeModule] Wikipedia fallback: %s", question)
+            else:
+                answer = (
+                    "無私人知識資料，維基百科亦未找到相符條目。"
+                    "請主公提供來源或自行查閱權威機構。"
+                )
 
         # ── 5. Persist to conversation memory ───────────────────────────────
         memory.add_user(question)
@@ -700,12 +867,14 @@ _SELF_REVIEW_TRIGGERS = [
     "SelfReviewModule", "selfreviewmodule", "自我審視",
     "TTSModule", "ttsmodule", "語音",
     "WorldModel", "worldmodel", "世界模型",
+    "WikipediaAdapter", "wikipedia", "維基百科", "大英百科", "百科全書",
+    "Britannica", "britannica", "百科",
     "Actor", "actor", "策略",
     "Critic", "critic", "批評者",
     "Replay", "replay", "回放",
     "Dreamer", "dreamer", "SAC",
     # English fallback terms
-    "code", "architecture", "design", "review",
+    "code", "architecture", "design", "review", "encyclopedia", "encyclop",
 ]
 
 # Sub-topic routing keywords — map user intent to assessment section keys.
@@ -729,6 +898,11 @@ _SELF_REVIEW_SUBTOPICS: list = [
     (["ValuePruner", "剪枝", "Pruner"],                                      "component_pruner"),
     (["SorryKing", "自省", "sorry"],                                         "component_sorry"),
     (["ConversationMemory", "對話記憶", "記憶"],                             "component_memory"),
+    # Encyclopedia — MUST come before component_knowledge: "百科知識" contains "知識"
+    # which would otherwise match the knowledge keywords first.
+    (["WikipediaAdapter", "Wikipedia", "wikipedia",
+      "維基百科", "大英百科", "百科全書", "百科", "encyclopedia",
+      "Britannica", "britannica"],                                           "component_encyclopedia"),
     (["KnowledgeModule", "知識模組", "知識庫", "知識"],                      "component_knowledge"),
     (["SelfReviewModule", "自我審視", "自我評估"],                           "component_selfreview"),
     (["TTSModule", "語音", "TTS"],                                           "component_tts"),
@@ -755,7 +929,8 @@ class SelfReviewModule:
         "overview": (
             "在下（Dreamer Sovereign v7.6）是一套單檔案 Python 強化學習代理，"
             "融合了 SAC 策略最佳化、世界模型、DreamerV3-style 想像展開、因果安全引擎、"
-            "雙層剪枝、TTS 語音、多輪對話記憶（支援 JSON 持久化），以及本模組——自我審視。"
+            "雙層剪枝、TTS 語音、多輪對話記憶（支援 JSON 持久化），"
+            "百科知識適配器（維基百科 REST API），以及本模組——自我審視。"
             "整體架構清晰，各模組職責分明，已針對安全性、知識擴展及訓練效率作出改進。"
         ),
         "architecture": (
@@ -771,7 +946,8 @@ class SelfReviewModule:
             "⑨ ConversationMemory — 有界雙端佇列，保留 20 輪對話，支援 JSON 持久化\n"
             "⑩ KnowledgeModule — 13 筆擴充領域知識（醫療/物理/化學/數學）\n"
             "⑪ TTSModule — Piper TTS 離線語音合成（模型路徑由環境變數管理）\n"
-            "⑫ SelfReviewModule — 本模組，代碼自我審視"
+            "⑫ SelfReviewModule — 本模組，代碼自我審視\n"
+            "⑬ WikipediaAdapter — 百科知識後備，免費開源維基百科 REST API"
         ),
         "strengths": (
             "優點：\n"
@@ -785,7 +961,9 @@ class SelfReviewModule:
             "• 因果拒絕閾值動態上升，避免永久鎖死\n"
             "• 想像展開（IMAGINE_STEPS=12）：世界模型每 5 步生成虛擬軌跡，增強訓練效率\n"
             "• 敏感配置（金鑰/TTS路徑/對話存檔路徑）由環境變數管理，不寫死代碼\n"
-            "• 知識庫擴展至 13 筆（5 醫療 + 3 物理 + 2 化學 + 3 數學）"
+            "• 知識庫擴展至 13 筆（5 醫療 + 3 物理 + 2 化學 + 3 數學）\n"
+            "• WikipediaAdapter：知識庫無命中時自動查詢維基百科，涵蓋全人類知識，"
+            "零額外依賴、支援離線降級（DREAMER_WIKI_ENABLED=false）"
         ),
         "weaknesses": (
             "仍待改進之處：\n"
@@ -793,7 +971,8 @@ class SelfReviewModule:
             "• World 環境仍較簡單，未支援 OpenAI Gym 介面\n"
             "• WorldModel 的想像展開精度受限於早期訓練品質（尚無不確定性估計）\n"
             "• SelfReviewModule 評估仍為靜態文字，未能反映模型訓練後的動態狀態\n"
-            "• 缺少更完整的整合測試覆蓋率（e2e 訓練迴路尚未自動化測試）"
+            "• 缺少更完整的整合測試覆蓋率（e2e 訓練迴路尚未自動化測試）\n"
+            "• WikipediaAdapter 依賴網路連線，離線環境下自動降級，但無本地快取持久化"
         ),
         "suggestions": (
             "建議下一步：\n"
@@ -801,7 +980,9 @@ class SelfReviewModule:
             "② 升級 World 環境為 OpenAI Gym 介面相容版本\n"
             "③ 為 WorldModel 加入 ensemble 不確定性估計，改善想像展開品質\n"
             "④ 讓 SelfReviewModule 動態讀取模型訓練狀態（loss 曲線、reward 趨勢）\n"
-            "⑤ 加入完整 e2e pytest 訓練迴路測試（mini-episode 煙霧測試）"
+            "⑤ 加入完整 e2e pytest 訓練迴路測試（mini-episode 煙霧測試）\n"
+            "⑥ 為 WikipediaAdapter 加入本地 JSON 快取持久化，改善離線體驗\n"
+            "⑦ 若持有 Britannica API 授權，可替換 WikipediaAdapter._fetch_summary() 使用官方 API"
         ),
         # ── Per-component deep dives ─────────────────────────────────────
         "component_causal": (
@@ -836,8 +1017,24 @@ class SelfReviewModule:
             "KnowledgeModule：\n"
             "13 筆知識（醫療 5 + 物理 3 + 化學 2 + 數學 3），"
             "支援 bigram 比對 + 上下文追問解析。\n"
-            "新增：糖尿病、高血壓、睡眠不足、相對論、牛頓定律、酸鹼中和、微積分、統計學。\n"
-            "優：即插即用、因果引擎保護、知識量大幅增加。待改：仍為關鍵字比對，需向量化。"
+            "本地知識庫命中優先（Tier 1）；無命中時自動轉交 WikipediaAdapter 查詢（Tier 2）。\n"
+            "優：即插即用、因果引擎保護、百科後備。待改：仍為關鍵字比對，需向量化。"
+        ),
+        "component_encyclopedia": (
+            "WikipediaAdapter（百科知識適配器）：\n"
+            "以維基百科（Wikipedia, CC BY-SA 4.0）作為免費開源的百科全書知識來源。\n"
+            "查詢流程：①本地知識庫無命中 → ② OpenSearch 確認最佳標題 → "
+            "③ REST page/summary API 取得文章摘要（含中文/英文降級）。\n"
+            "配置：\n"
+            "  DREAMER_WIKI_ENABLED=false  — 完全關閉（離線模式）\n"
+            "  DREAMER_WIKI_LANG=zh        — 主語言（預設 zh，zh→en 自動降級）\n"
+            "  DREAMER_WIKI_TIMEOUT_SEC=5  — HTTP 超時（秒）\n"
+            "LRU 快取（128 條），同一查詢不重複發送網路請求。\n"
+            "關於大英百科全書（Encyclopaedia Britannica）：\n"
+            "  Britannica 內容受版權保護，API 需付費授權（developer.eb.com）。\n"
+            "  如持有授權，可替換 _fetch_summary() 接入 api.eb.com。\n"
+            "優：零額外依賴、涵蓋全人類知識、離線安全降級。"
+            "待改：依賴網路，快取未持久化，無法保證條目品質。"
         ),
         "component_selfreview": (
             "SelfReviewModule（本模組）：\n"
