@@ -267,6 +267,25 @@ class ValuePruner:
             return False, "剩餘時間不足，無法安全完成"
         return True, "安全"
 
+    def is_query_safe(self, query: str) -> tuple:
+        """Content-based pre-fetch causal filter (因果裁斷過濾).
+
+        Before sending any natural-language query to an external data source
+        (e.g. WikipediaAdapter), call this method to ensure dangerous queries
+        never leave the system boundary.  Unlike ``is_safe()``, this method
+        operates purely on query text — no RL distance/step context required.
+
+        Uses the same bilingual (Chinese + English) danger keyword list as
+        ``is_safe()``.
+
+        Returns ``(is_safe: bool, reason: str)``.
+        """
+        q_lower = query.lower()
+        for kw in self.danger_keywords:
+            if kw in q_lower:
+                return False, f"查詢觸發危險關鍵字「{kw}」，拒絕抓取外部資料"
+        return True, "查詢通過因果裁斷，允許抓取外部資料"
+
 
 # ────────────────────────────────────────────────
 # Sorry King
@@ -744,12 +763,15 @@ class KnowledgeModule:
 
         Algorithm
         ---------
-        1. Causal-engine safety check (unchanged).
+        1. Causal-engine safety check (history-based correlation guard).
         2. Detect whether *question* is a follow-up referencing previous turns
            (pronoun / trigger-word scan).
-        3. If it is a follow-up and we already discussed a topic, prepend that
-           context so the answer is coherent with the prior turn.
-        4. Record the Q&A pair into the shared ``ConversationMemory``.
+        3. Knowledge-base lookup (local Tier 1 entries).
+        4. If no local match: pre-fetch causal filter (因果裁斷過濾) via
+           ``ValuePruner.is_query_safe`` — dangerous queries are rejected
+           before any external network request leaves the system boundary.
+        5. If query passes the filter: Wikipedia encyclopedic fallback (Tier 2).
+        6. Record the Q&A pair into the shared ``ConversationMemory``.
         """
         memory: ConversationMemory = self.agent.conversation
 
@@ -822,6 +844,21 @@ class KnowledgeModule:
                 f"如需更深入說明，請主公告知具體方向。"
             )
         else:
+            # ── Pre-fetch causal filter (因果裁斷過濾) ──────────────────────
+            # Before forwarding the query to an external service (Wikipedia),
+            # run a content-based safety check through ValuePruner so that
+            # dangerous queries never leave the system boundary.
+            fetch_safe, fetch_reason = self.agent.pruner.is_query_safe(question)
+            if not fetch_safe:
+                answer = f"外部資料抓取已遭因果裁斷攔截：{fetch_reason}"
+                logger.warning(
+                    "[KnowledgeModule] 因果裁斷攔截外部查詢：%s | %s",
+                    question, fetch_reason,
+                )
+                memory.add_user(question)
+                memory.add_assistant(answer)
+                return answer
+
             # ── Tier 2: Wikipedia encyclopedic fallback ─────────────────────
             # When local knowledge has no match, consult the free encyclopedic
             # knowledge base (Wikipedia) as an authoritative secondary source.
@@ -963,7 +1000,9 @@ class SelfReviewModule:
             "• 敏感配置（金鑰/TTS路徑/對話存檔路徑）由環境變數管理，不寫死代碼\n"
             "• 知識庫擴展至 13 筆（5 醫療 + 3 物理 + 2 化學 + 3 數學）\n"
             "• WikipediaAdapter：知識庫無命中時自動查詢維基百科，涵蓋全人類知識，"
-            "零額外依賴、支援離線降級（DREAMER_WIKI_ENABLED=false）"
+            "零額外依賴、支援離線降級（DREAMER_WIKI_ENABLED=false）\n"
+            "• 因果裁斷預篩選（ValuePruner.is_query_safe）：外部資料抓取前先行內容安全過濾，"
+            "危險查詢不出系統邊界"
         ),
         "weaknesses": (
             "仍待改進之處：\n"
@@ -1023,8 +1062,9 @@ class SelfReviewModule:
         "component_encyclopedia": (
             "WikipediaAdapter（百科知識適配器）：\n"
             "以維基百科（Wikipedia, CC BY-SA 4.0）作為免費開源的百科全書知識來源。\n"
-            "查詢流程：①本地知識庫無命中 → ② OpenSearch 確認最佳標題 → "
-            "③ REST page/summary API 取得文章摘要（含中文/英文降級）。\n"
+            "查詢流程：①本地知識庫無命中 → ②因果裁斷預篩選（ValuePruner.is_query_safe）"
+            "→ ③ OpenSearch 確認最佳標題 → "
+            "④ REST page/summary API 取得文章摘要（含中文/英文降級）。\n"
             "配置：\n"
             "  DREAMER_WIKI_ENABLED=false  — 完全關閉（離線模式）\n"
             "  DREAMER_WIKI_LANG=zh        — 主語言（預設 zh，zh→en 自動降級）\n"
@@ -1033,7 +1073,7 @@ class SelfReviewModule:
             "關於大英百科全書（Encyclopaedia Britannica）：\n"
             "  Britannica 內容受版權保護，API 需付費授權（developer.eb.com）。\n"
             "  如持有授權，可替換 _fetch_summary() 接入 api.eb.com。\n"
-            "優：零額外依賴、涵蓋全人類知識、離線安全降級。"
+            "優：零額外依賴、涵蓋全人類知識、離線安全降級、危險查詢因果裁斷前置攔截。"
             "待改：依賴網路，快取未持久化，無法保證條目品質。"
         ),
         "component_selfreview": (

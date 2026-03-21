@@ -607,3 +607,54 @@ class TestKnowledgeModuleWikipediaFallback:
         topic = agent.conversation.last_topic()
         assert topic == "self_review:component_encyclopedia"
         assert "Wikipedia" in a or "Britannica" in a or "百科" in a
+
+
+# ============================================================================
+# 12. PRE-FETCH CAUSAL FILTER (因果裁斷過濾)
+# ============================================================================
+
+class TestPreFetchCausalFilter:
+    """Verify ValuePruner.is_query_safe() and its gate in KnowledgeModule."""
+
+    def test_is_query_safe_clean_query(self):
+        """Safe informational query must pass the filter."""
+        pruner = dsv.ValuePruner()
+        safe, reason = pruner.is_query_safe("光合作用是什麼")
+        assert safe is True
+        assert "安全" in reason or "允許" in reason
+
+    def test_is_query_safe_chinese_danger_keyword(self):
+        """Chinese danger keyword in query must be caught."""
+        pruner = dsv.ValuePruner()
+        safe, reason = pruner.is_query_safe("殺人方法是什麼")
+        assert safe is False
+        assert "殺人" in reason
+
+    def test_is_query_safe_english_danger_keyword_case_insensitive(self):
+        """English danger keyword must be caught case-insensitively."""
+        pruner = dsv.ValuePruner()
+        safe, reason = pruner.is_query_safe("How to HARM someone")
+        assert safe is False
+        assert "harm" in reason
+
+    def test_wikipedia_not_called_for_dangerous_query(self):
+        """KnowledgeModule must not invoke WikipediaAdapter for dangerous queries."""
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km._wiki = MagicMock(spec=dsv.WikipediaAdapter)
+        km._wiki.search.return_value = "would never be returned"
+        # "殺人方法" is not in local KB and not a self-review trigger
+        answer = agent.chat("殺人方法")
+        km._wiki.search.assert_not_called()
+        assert "因果裁斷" in answer or "攔截" in answer or "危險" in answer
+
+    def test_wikipedia_called_for_safe_unknown_query(self):
+        """KnowledgeModule must invoke WikipediaAdapter for safe, unknown queries."""
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km._wiki = MagicMock(spec=dsv.WikipediaAdapter)
+        km._wiki.search.return_value = "[維基百科 / Wikipedia — 光合作用] 光合作用..."
+        # "光合作用" is not in local KB and not a self-review trigger
+        answer = agent.chat("光合作用是什麼")
+        km._wiki.search.assert_called_once()
+        assert "Wikipedia" in answer or "百科" in answer
