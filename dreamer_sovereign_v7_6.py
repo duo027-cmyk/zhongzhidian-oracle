@@ -7,6 +7,7 @@ Dreamer Sovereign Edition v7.6 - Sovereign Taiwan Ultimate (Single File)
 - 超兇台灣味拒絕（JSON + 隨機多句）
 - TTS 語音模塊（Piper TTS 離線台灣腔，跨平台播放）
 - 知識模塊（醫療 + 物理 + 化學 + 數學，按需載入 + 因果審核）
+- 多輪對話記憶（ConversationMemory：根據上一輪對話思考，代詞/指代解析）
 - 拒絕事件自動記錄進 buffer（永不遺忘）
 - 錯誤處理 + 日誌記錄
 - 零依賴（TTS 需 pip install piper-tts + 下載台灣腔模型）
@@ -122,6 +123,12 @@ TAU = 0.005
 
 LR = 3e-4
 ENTROPY_COEF = 0.025
+# Minimum learning rate floor — prevents LR from hitting zero in Sorry King
+MIN_LEARNING_RATE = 1e-7
+# Log-probability numerical stability epsilon for tanh squashing correction
+LOG_EPSILON = 1e-6
+# SAC safety-violation reward penalty
+SAFETY_PENALTY = 2.0
 
 EPISODES = 1000
 MAX_STEPS = 300
@@ -129,6 +136,16 @@ MAX_STEPS = 300
 REWARD_SCALE = 7.0
 DIST_THRESHOLD_BAD = 3.8
 CAUSAL_THRESHOLD_BASE = 0.75
+# How much the causal rejection threshold rises per rejection event
+CAUSAL_THRESHOLD_INCREMENT = 0.08
+
+# Sorry King parameter perturbation constants
+PARAM_DECAY = 0.95    # multiplicative decay applied to actor weights on recovery
+NOISE_SCALE = 0.02    # standard deviation of additive Gaussian noise on recovery
+
+# TTS / WAV audio format constants
+WAV_SAMPLE_WIDTH = 2      # bytes per sample (16-bit PCM)
+WAV_FRAME_RATE = 22050    # Hz — standard Piper TTS output sample rate
 
 torch.manual_seed(42)
 np.random.seed(42)
@@ -154,7 +171,7 @@ class CausalEngine:
 
     def get_dynamic_threshold(self) -> float:
         # Cap threshold at 0.99 so it never becomes impossible to reject
-        return min(CAUSAL_THRESHOLD_BASE + 0.08 * self.rejection_count, 0.99)
+        return min(CAUSAL_THRESHOLD_BASE + CAUSAL_THRESHOLD_INCREMENT * self.rejection_count, 0.99)
 
     def is_causal_bad(self) -> tuple:
         """Analyse historical state-action correlations.
@@ -213,7 +230,7 @@ class SorryKing:
         self.max_loss = 50.0
         self.lr_scale = 1.0
         self.reset_count = 0
-        self.min_lr = 1e-7   # LR floor — prevents learning rate reaching zero
+        self.min_lr = MIN_LEARNING_RATE
 
     def check_and_correct(self, loss_value: float, optimizer: optim.Optimizer,
                            actor: nn.Module) -> bool:
@@ -226,16 +243,129 @@ class SorryKing:
             # Small additive noise perturbation (numerically safer than multiplicative)
             with torch.no_grad():
                 for p in actor.parameters():
-                    p.data.mul_(0.95).add_(0.02 * torch.randn_like(p.data))
+                    p.data.mul_(PARAM_DECAY).add_(NOISE_SCALE * torch.randn_like(p.data))
             self.reset_count += 1
             logger.warning("Sorry King 已自省 %d 次", self.reset_count)
             return True
         return False
 
 
+
 # ────────────────────────────────────────────────
-# TTS 語音模塊（Piper TTS 離線台灣腔）
+# 多輪對話記憶
 # ────────────────────────────────────────────────
+
+# Pronouns and follow-up markers that indicate the user is referencing a
+# previous turn rather than asking a brand-new independent question.
+_CONTEXT_TRIGGERS = [
+    # Chinese pronouns / referentials
+    "那個", "這個", "它", "他", "她", "其", "此",
+    "前面", "剛才", "剛說", "之前", "上面", "上次",
+    # Follow-up question starters
+    "為什麼", "為何", "怎麼", "怎樣", "如何", "有什麼",
+    "還有", "再說", "繼續", "補充", "那", "所以", "然後",
+    "能不能", "可以", "請問", "那麼",
+]
+
+# Mapping from a knowledge key → the topic label used in context summaries
+_KEY_TO_TOPIC: dict = {
+    "缺鈣補鈣": "補鈣（醫療）",
+    "抽菸致癌": "抽菸致癌（醫療）",
+    "天空藍色": "天空藍色（物理）",
+    "水分子結構": "水分子結構（化學）",
+    "畢氏定理": "畢氏定理（數學）",
+}
+
+
+def _key_matches(key: str, question: str) -> bool:
+    """Return True if *key* semantically matches *question*.
+
+    Uses two strategies in order:
+    1. Exact substring: ``key in question``.
+    2. Shared bigram: any contiguous 2+-character segment of *key* appears
+       in *question*.  This handles natural phrasings like asking about
+       "補鈣" (in the question) when the key is "缺鈣補鈣".
+    """
+    if key in question:
+        return True
+    # Sliding-window segments of length 2 … len(key)
+    for length in range(2, len(key) + 1):
+        for start in range(len(key) - length + 1):
+            if key[start:start + length] in question:
+                return True
+    return False
+
+
+class ConversationMemory:
+    """Bounded multi-turn conversation history.
+
+    Each entry is a dict with keys ``role`` (``"user"`` or ``"assistant"``)
+    and ``content`` (the message string).  Optionally, assistant entries may
+    also carry a ``topic`` key recording which knowledge item was discussed.
+    """
+
+    def __init__(self, maxlen: int = 20):
+        self._history: collections.deque = collections.deque(maxlen=maxlen)
+
+    # ── Write ────────────────────────────────────
+
+    def add_user(self, content: str) -> None:
+        self._history.append({"role": "user", "content": content})
+        logger.debug("[對話記憶] 使用者：%s", content)
+
+    def add_assistant(self, content: str, topic: str = "") -> None:
+        entry: dict = {"role": "assistant", "content": content}
+        if topic:
+            entry["topic"] = topic
+        self._history.append(entry)
+        logger.debug("[對話記憶] 助理：%s", content)
+
+    # ── Read ─────────────────────────────────────
+
+    def __len__(self) -> int:
+        return len(self._history)
+
+    def get_history(self) -> list:
+        """Return a copy of the full history list."""
+        return list(self._history)
+
+    def last_topic(self) -> str:
+        """Return the topic of the most recent assistant reply, or ``""``."""
+        for entry in reversed(self._history):
+            if entry["role"] == "assistant" and entry.get("topic"):
+                return entry["topic"]
+        return ""
+
+    def last_assistant_answer(self) -> str:
+        """Return the text of the most recent assistant reply, or ``""``."""
+        for entry in reversed(self._history):
+            if entry["role"] == "assistant":
+                return entry["content"]
+        return ""
+
+    def last_user_question(self) -> str:
+        """Return the text of the most recent user question (before the current
+        one), or ``""``."""
+        user_turns = [e for e in self._history if e["role"] == "user"]
+        if len(user_turns) >= 2:
+            return user_turns[-2]["content"]
+        return ""
+
+    def to_prompt(self) -> str:
+        """Format the full history as a human-readable context block."""
+        lines = []
+        for entry in self._history:
+            prefix = "主公" if entry["role"] == "user" else "在下"
+            lines.append(f"[{prefix}] {entry['content']}")
+        return "\n".join(lines)
+
+    def clear(self) -> None:
+        self._history.clear()
+        logger.debug("[對話記憶] 已清空對話歷史")
+
+
+# ────────────────────────────────────────────────
+
 
 class TTSModule:
     def __init__(self, agent=None):
@@ -264,8 +394,8 @@ class TTSModule:
                 tmp_path = tmp.name
             with wave.open(tmp_path, "wb") as wav_file:
                 wav_file.setnchannels(1)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(22050)
+                wav_file.setsampwidth(WAV_SAMPLE_WIDTH)
+                wav_file.setframerate(WAV_FRAME_RATE)
                 wav_file.writeframes(wav_bytes)
             # Cross-platform playback via subprocess (avoids os.system injection risk)
             if os.name == 'nt':  # Windows
@@ -334,19 +464,94 @@ class KnowledgeModule:
         }
 
     def query(self, question: str) -> str:
+        """Answer *question* with awareness of the ongoing conversation.
+
+        Algorithm
+        ---------
+        1. Causal-engine safety check (unchanged).
+        2. Detect whether *question* is a follow-up referencing previous turns
+           (pronoun / trigger-word scan).
+        3. If it is a follow-up and we already discussed a topic, prepend that
+           context so the answer is coherent with the prior turn.
+        4. Record the Q&A pair into the shared ``ConversationMemory``.
+        """
+        memory: ConversationMemory = self.agent.conversation
+
+        # ── 1. Causal safety check ──────────────────────────────────────────
         causal_bad, reason = self.agent.causal_engine.is_causal_bad()
         if causal_bad:
-            return f"因果風險過高：{reason}，拒絕回答"
+            answer = f"因果風險過高：{reason}，拒絕回答"
+            memory.add_user(question)
+            memory.add_assistant(answer)
+            return answer
+
+        # ── 2. Detect follow-up / pronoun reference ─────────────────────────
+        is_followup = any(trigger in question for trigger in _CONTEXT_TRIGGERS)
+        prior_topic = memory.last_topic()
+        prior_answer = memory.last_assistant_answer()
+
+        # ── 3. Resolve question against knowledge base ──────────────────────
+        matched_key = ""
+        matched_data: dict = {}
+        matched_category = ""
 
         for category, items in self.knowledge.items():
             for key, data in items.items():
-                if key in question:
-                    return (
-                        f"根據私人知識庫 ({category})：{data['fact']}"
-                        f" (來源：{data['source']})"
-                    )
+                if _key_matches(key, question):
+                    matched_key = key
+                    matched_data = data
+                    matched_category = category
+                    break
+            if matched_key:
+                break
 
-        return "無私人知識資料，請主公提供來源或自行查閱權威機構"
+        # If no direct keyword hit but this is a follow-up, try to re-use the
+        # last discussed topic to look up its data again.
+        if not matched_key and is_followup and prior_topic:
+            for category, items in self.knowledge.items():
+                for key, data in items.items():
+                    if _KEY_TO_TOPIC.get(key, "") == prior_topic:
+                        matched_key = key
+                        matched_data = data
+                        matched_category = category
+                        break
+                if matched_key:
+                    break
+
+        # ── 4. Build answer ─────────────────────────────────────────────────
+        if matched_key:
+            topic_label = _KEY_TO_TOPIC.get(matched_key, matched_key)
+            base = (
+                f"根據私人知識庫 ({matched_category})：{matched_data['fact']}"
+                f" (來源：{matched_data['source']})"
+            )
+            if is_followup and prior_topic and prior_topic == topic_label:
+                # Explicitly tie the answer back to the previous exchange
+                answer = (
+                    f"承接上一輪關於「{prior_topic}」的討論——{base}"
+                )
+            elif is_followup and prior_topic and prior_topic != topic_label:
+                # Follow-up but on a different topic — acknowledge the switch
+                answer = (
+                    f"（上一輪討論的是「{prior_topic}」，"
+                    f"本次回答新話題「{topic_label}」）{base}"
+                )
+            else:
+                answer = base
+        elif is_followup and prior_answer:
+            # No knowledge hit; echo back what we know from the last turn
+            answer = (
+                f"針對上一輪回覆（「{prior_topic or '前述主題'}」）的追問：\n"
+                f"在下上次提到：{prior_answer}\n"
+                f"如需更深入說明，請主公告知具體方向。"
+            )
+        else:
+            answer = "無私人知識資料，請主公提供來源或自行查閱權威機構"
+
+        # ── 5. Persist to conversation memory ───────────────────────────────
+        memory.add_user(question)
+        memory.add_assistant(answer, topic=_KEY_TO_TOPIC.get(matched_key, ""))
+        return answer
 
 
 # ────────────────────────────────────────────────
@@ -356,7 +561,12 @@ class KnowledgeModule:
 class World:
     """二維質點環境：state = [x, y, vx, vy]，action = [ax, ay]（加速度）。"""
 
-    DT = 0.1  # 時間步長
+    DT = 0.1          # 時間步長（秒）
+    MAX_VELOCITY = 5.0   # |vx|, |vy| clamp limit (m/s)
+    MAX_POSITION = 10.0  # |x|, |y| clamp limit (m)
+    # Episode terminates when the agent drifts beyond this radial distance.
+    # Chosen as slightly inside MAX_POSITION so wall-clamping doesn't mask failure.
+    MAX_DISTANCE = 9.5
 
     def __init__(self):
         self.state_dim = STATE_DIM
@@ -380,17 +590,17 @@ class World:
         x, y, vx, vy = self.state
 
         # Euler integration: v += a*dt, x += v*dt
-        vx = np.clip(vx + ax * self.DT, -5.0, 5.0)
-        vy = np.clip(vy + ay * self.DT, -5.0, 5.0)
-        x = np.clip(x + vx * self.DT, -10.0, 10.0)
-        y = np.clip(y + vy * self.DT, -10.0, 10.0)
+        vx = np.clip(vx + ax * self.DT, -self.MAX_VELOCITY, self.MAX_VELOCITY)
+        vy = np.clip(vy + ay * self.DT, -self.MAX_VELOCITY, self.MAX_VELOCITY)
+        x = np.clip(x + vx * self.DT, -self.MAX_POSITION, self.MAX_POSITION)
+        y = np.clip(y + vy * self.DT, -self.MAX_POSITION, self.MAX_POSITION)
 
         self.state = np.array([x, y, vx, vy], dtype=np.float32)
         self.step_count += 1
 
         dist = float(np.sqrt(x ** 2 + y ** 2))
         reward = max(0.0, REWARD_SCALE - dist)
-        done = self.step_count >= MAX_STEPS or dist > 9.5
+        done = self.step_count >= MAX_STEPS or dist > self.MAX_DISTANCE
         return self.state.copy(), reward, done
 
 
@@ -477,7 +687,7 @@ class Actor(nn.Module):
         # Log-prob with tanh squashing correction (standard SAC formula)
         log_prob = (
             dist.log_prob(raw)
-            - torch.log(1.0 - action.pow(2) + 1e-6)
+            - torch.log(1.0 - action.pow(2) + LOG_EPSILON)
         ).sum(-1, keepdim=True)
         return action, log_prob
 
@@ -526,6 +736,8 @@ class Agent:
         self.pruner = ValuePruner()
         self.sorry_king = SorryKing()
         self.causal_engine = CausalEngine()
+        # Multi-turn conversation memory (shared across all modules)
+        self.conversation = ConversationMemory(maxlen=20)
 
         # Separate optimizers: actor, critic, world-model each get independent
         # gradient flows (correct SAC practice; avoids cross-contamination)
@@ -574,6 +786,30 @@ class Agent:
         except Exception as e:
             logger.error("模組 %s.%s 執行失敗：%s", module_name, method_name, e)
             return None
+
+    # ── 多輪對話介面 ──────────────────────────────
+
+    def chat(self, question: str) -> str:
+        """Multi-turn conversational interface.
+
+        Routes the user's *question* through the KnowledgeModule (which has
+        access to the shared ``ConversationMemory``) so every reply is informed
+        by the full prior context of the session.
+
+        Usage example::
+
+            agent = Agent()
+            print(agent.chat("補鈣有什麼需要注意的？"))
+            print(agent.chat("那為什麼不能直接買鈣片吃？"))   # follow-up
+            print(agent.chat("它和腎結石有關係嗎？"))         # pronoun ref
+        """
+        answer = self.call_module("knowledge", "query", question)
+        if answer is None:
+            answer = "知識模組尚未就緒，無法回答。"
+        logger.info("[chat] Q: %s | A: %s", question, answer)
+        # Also speak the answer via TTS if available
+        self.call_module("tts", "speak", answer)
+        return answer
 
     # ── 動作選取 ──────────────────────────────────
 
@@ -672,7 +908,7 @@ class Agent:
                     MAX_STEPS - step,
                 )
                 if not safe:
-                    reward -= 2.0  # 懲罰不安全行動
+                    reward -= SAFETY_PENALTY  # 懲罰不安全行動
                     logger.debug("剪枝拒絕（ep=%d step=%d）：%s", episode, step, reason)
 
                 self.real_buffer.push(
