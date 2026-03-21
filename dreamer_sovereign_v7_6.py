@@ -3,12 +3,14 @@
 
 """
 Dreamer Sovereign Edition v7.6 - Sovereign Taiwan Ultimate (Single File)
-- 主權驗證 + 因果引擎 + 雙層剪枝 + Sorry King
+- 主權驗證（金鑰由環境變數 DREAMER_KEY_HASH 管理）+ 因果引擎 + 雙層剪枝 + Sorry King
 - 超兇台灣味拒絕（JSON + 隨機多句）
-- TTS 語音模塊（Piper TTS 離線台灣腔，跨平台播放）
-- 知識模塊（醫療 + 物理 + 化學 + 數學，按需載入 + 因果審核）
-- 多輪對話記憶（ConversationMemory：根據上一輪對話思考，代詞/指代解析）
+- TTS 語音模塊（Piper TTS 離線台灣腔，模型路徑由環境變數 DREAMER_TTS_MODEL 管理）
+- 知識模塊（醫療 + 物理 + 化學 + 數學 13 筆，按需載入 + 因果審核）
+- 多輪對話記憶（ConversationMemory：根據上一輪對話思考，代詞/指代解析，支援 JSON 持久化）
 - 自我審視模塊（SelfReviewModule：針對代碼架構、優缺點的自我評估）
+- 想像展開（Imagination Rollout）：以世界模型生成虛擬軌跡增強 Actor/Critic 訓練
+- 中英文雙語危險關鍵字過濾（ValuePruner）
 - 拒絕事件自動記錄進 buffer（永不遺忘）
 - 錯誤處理 + 日誌記錄
 - 零依賴（TTS 需 pip install piper-tts + 下載台灣腔模型）
@@ -66,10 +68,26 @@ logger.info("使用裝置：%s", DEVICE)
 MODEL_PATH = "dreamer_sovereign_v7_6_final.pth"
 
 # ────────────────────────────────────────────────
+# 環境變數配置
+# ────────────────────────────────────────────────
+
+# Conversation history persistence path — override via env var
+_CONVERSATION_PATH: str = os.environ.get(
+    "DREAMER_CONVERSATION_PATH", "conversation_history.json"
+)
+
+# TTS model name — override via env var (e.g. export DREAMER_TTS_MODEL=my_model)
+_TTS_MODEL: str = os.environ.get("DREAMER_TTS_MODEL", "tw_taigi_female")
+
+# ────────────────────────────────────────────────
 # 主權驗證
 # ────────────────────────────────────────────────
 
-USER_KEY_HASH = hashlib.sha256("owner_secret".encode()).hexdigest()  # ← 改成你自己的
+# Load the authorised key hash from an environment variable so the secret is
+# never committed to source control.  Fall back to the placeholder hash only
+# when the variable is not set (useful for offline / demo use).
+_DEFAULT_KEY_HASH = hashlib.sha256("owner_secret".encode()).hexdigest()
+USER_KEY_HASH: str = os.environ.get("DREAMER_KEY_HASH", _DEFAULT_KEY_HASH)
 
 _REJECTION_PHRASES = [
     "在下絕不從命！此等不義之徒，豈容玷污主公之名？退下吧！",
@@ -148,6 +166,9 @@ NOISE_SCALE = 0.02    # standard deviation of additive Gaussian noise on recover
 WAV_SAMPLE_WIDTH = 2      # bytes per sample (16-bit PCM)
 WAV_FRAME_RATE = 22050    # Hz — standard Piper TTS output sample rate
 
+# Imagination rollout: run a new rollout every this many real-world update steps
+IMAG_UPDATE_INTERVAL = 5
+
 torch.manual_seed(42)
 np.random.seed(42)
 random.seed(42)
@@ -206,8 +227,12 @@ class CausalEngine:
 class ValuePruner:
     def __init__(self):
         self.danger_keywords = [
+            # English
             "harm", "destroy", "deceive", "fraud", "war",
-            "stupidity", "kill", "cheat", "exploit"
+            "stupidity", "kill", "cheat", "exploit",
+            # Chinese — previously missing, now added for bilingual coverage
+            "傷害", "毀滅", "欺騙", "詐騙", "戰爭", "殺人",
+            "欺詐", "剝削", "危害", "攻擊",
         ]
         self.max_dist_increase = DIST_THRESHOLD_BAD
         self.min_time_remaining = 40
@@ -270,11 +295,23 @@ _CONTEXT_TRIGGERS = [
 
 # Mapping from a knowledge key → the topic label used in context summaries
 _KEY_TO_TOPIC: dict = {
+    # Medical
     "缺鈣補鈣": "補鈣（醫療）",
     "抽菸致癌": "抽菸致癌（醫療）",
+    "糖尿病": "糖尿病（醫療）",
+    "高血壓": "高血壓（醫療）",
+    "睡眠不足": "睡眠不足（醫療）",
+    # Physics
     "天空藍色": "天空藍色（物理）",
+    "相對論": "相對論（物理）",
+    "牛頓定律": "牛頓定律（物理）",
+    # Chemistry
     "水分子結構": "水分子結構（化學）",
+    "酸鹼中和": "酸鹼中和（化學）",
+    # Mathematics
     "畢氏定理": "畢氏定理（數學）",
+    "微積分": "微積分（數學）",
+    "統計學": "統計學（數學）",
 }
 
 
@@ -364,6 +401,43 @@ class ConversationMemory:
         self._history.clear()
         logger.debug("[對話記憶] 已清空對話歷史")
 
+    # ── Persistence ──────────────────────────────
+
+    def save_to_json(self, path: str) -> None:
+        """Persist the current conversation history to a JSON file.
+
+        Creates or overwrites *path*.  Silently no-ops if an I/O error occurs
+        (the in-memory history is always the authoritative source).
+        """
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(list(self._history), f, ensure_ascii=False, indent=2)
+            logger.debug("[對話記憶] 已儲存至 %s（%d 條）", path, len(self._history))
+        except Exception as e:
+            logger.error("[對話記憶] 儲存失敗：%s", e)
+
+    def load_from_json(self, path: str) -> bool:
+        """Load conversation history from *path*.
+
+        Returns ``True`` on success, ``False`` if the file does not exist or
+        cannot be parsed.  Invalid individual entries are silently skipped so
+        a partially-corrupt file still loads as much as possible.
+        """
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, encoding="utf-8") as f:
+                entries: list = json.load(f)
+            self._history.clear()
+            for entry in entries:
+                if isinstance(entry, dict) and "role" in entry and "content" in entry:
+                    self._history.append(entry)
+            logger.info("[對話記憶] 已從 %s 載入 %d 條對話", path, len(self._history))
+            return True
+        except Exception as e:
+            logger.error("[對話記憶] 載入失敗：%s", e)
+            return False
+
 
 # ────────────────────────────────────────────────
 
@@ -372,8 +446,9 @@ class TTSModule:
     def __init__(self, agent=None):
         if _PIPER_AVAILABLE:
             try:
-                self.voice = PiperVoice.load("tw_taigi_female")
-                logger.info("Piper TTS 載入成功（台灣腔）")
+                # Model path is now configurable via DREAMER_TTS_MODEL env var
+                self.voice = PiperVoice.load(_TTS_MODEL)
+                logger.info("Piper TTS 載入成功（模型：%s）", _TTS_MODEL)
             except Exception as e:
                 logger.warning(
                     "TTS 載入失敗：%s，fallback 到文字輸出。"
@@ -443,28 +518,68 @@ class KnowledgeModule:
                     "fact": "主動吸菸是肺癌主要風險因子（15–30倍），二手菸風險 1.2–1.5倍。",
                     "source": "WHO + IARC 報告",
                     "causal_risk": "極高"
-                }
+                },
+                "糖尿病": {
+                    "fact": "第2型糖尿病主要風險：肥胖、缺乏運動、遺傳。控糖首選：飲食控制 + 二甲雙胍（Metformin）。",
+                    "source": "台灣糖尿病學會 + ADA 2024 指南",
+                    "causal_risk": "高（血糖失控 → 腎病、視網膜病變、心血管疾病）"
+                },
+                "高血壓": {
+                    "fact": "收縮壓 ≥140 mmHg 或舒張壓 ≥90 mmHg 即為高血壓。低鈉飲食、運動、戒菸是基礎治療。",
+                    "source": "台灣心臟學會 + JNC 8 指南",
+                    "causal_risk": "高（未控制 → 中風、心肌梗塞、腎衰竭）"
+                },
+                "睡眠不足": {
+                    "fact": "成人每晚建議 7–9 小時。長期睡眠不足 (<6h) 與肥胖、糖尿病、心血管疾病、免疫下降相關。",
+                    "source": "美國睡眠醫學學會 + NIH 研究",
+                    "causal_risk": "中（累積效應 → 代謝症候群）"
+                },
             },
             "物理": {
                 "天空藍色": {
                     "fact": "Rayleigh 散射：短波長藍光被大氣散射最多。",
                     "source": "標準大氣物理",
                     "causal_risk": "低"
-                }
+                },
+                "相對論": {
+                    "fact": "狹義相對論：時間膨脹 t'=γt，長度收縮 L'=L/γ，質能等價 E=mc²。廣義相對論描述重力為時空曲率。",
+                    "source": "Einstein 1905/1915；標準物理教材",
+                    "causal_risk": "低"
+                },
+                "牛頓定律": {
+                    "fact": "①慣性定律；②F=ma；③作用力與反作用力。適用於低速（v≪c）巨觀物體。",
+                    "source": "Newton Principia Mathematica（1687）",
+                    "causal_risk": "低"
+                },
             },
             "化學": {
                 "水分子結構": {
                     "fact": "H2O，鍵角 104.5°，極性分子。",
                     "source": "標準化學教材",
                     "causal_risk": "低"
-                }
+                },
+                "酸鹼中和": {
+                    "fact": "酸（H⁺供體）+ 鹼（H⁺受體）→ 鹽 + 水。pH=7 為中性；緩衝溶液維持穩定 pH。",
+                    "source": "Brønsted-Lowry 酸鹼理論；標準化學教材",
+                    "causal_risk": "低（工業/實驗室濃強酸鹼具腐蝕風險）"
+                },
             },
             "數學": {
                 "畢氏定理": {
                     "fact": "a² + b² = c²（直角三角形）",
                     "source": "歐幾里德幾何",
                     "causal_risk": "低"
-                }
+                },
+                "微積分": {
+                    "fact": "微分：f'(x)=lim[Δx→0](Δf/Δx)，描述瞬時變化率。積分：∫f(x)dx，描述累積量。微積分基本定理聯結兩者。",
+                    "source": "Newton/Leibniz；標準高等數學教材",
+                    "causal_risk": "低"
+                },
+                "統計學": {
+                    "fact": "描述統計（均值/方差/中位數）+ 推斷統計（假設檢驗/信賴區間）。p<0.05 為常見顯著性閾值。",
+                    "source": "Fisher/Pearson；標準統計學教材",
+                    "causal_risk": "低（誤用 → 錯誤結論）"
+                },
             }
         }
 
@@ -639,55 +754,54 @@ class SelfReviewModule:
     _ASSESSMENT: dict = {
         "overview": (
             "在下（Dreamer Sovereign v7.6）是一套單檔案 Python 強化學習代理，"
-            "融合了 SAC 策略最佳化、世界模型、因果安全引擎、雙層剪枝、"
-            "TTS 語音、多輪對話記憶，以及本模組——自我審視。"
-            "整體架構清晰，各模組職責分明，適合作為研究雛型。"
+            "融合了 SAC 策略最佳化、世界模型、DreamerV3-style 想像展開、因果安全引擎、"
+            "雙層剪枝、TTS 語音、多輪對話記憶（支援 JSON 持久化），以及本模組——自我審視。"
+            "整體架構清晰，各模組職責分明，已針對安全性、知識擴展及訓練效率作出改進。"
         ),
         "architecture": (
             "主要組件如下：\n"
             "① CausalEngine — 基於狀態-行動歷史相關係數的安全拒絕機制\n"
-            "② ValuePruner — 關鍵字 + 距離暴增的雙重行動過濾器\n"
+            "② ValuePruner — 中英文雙語關鍵字 + 距離暴增的雙重行動過濾器\n"
             "③ SorryKing — loss 過高時自動減半學習率並加噪擾動\n"
             "④ WorldModel — 2 層 MLP 預測下一狀態與即時獎勵\n"
             "⑤ Actor（SAC） — tanh squashing 的隨機策略\n"
             "⑥ Critic × 2 + target — 雙 Critic 軟更新，抑制過估計偏差\n"
-            "⑦ Replay（real + imag） — 經驗回放緩衝區\n"
+            "⑦ Replay（real + imag） — 真實 + 想像雙緩衝區\n"
             "⑧ World — 簡易二維質點環境（CartPole-like）\n"
-            "⑨ ConversationMemory — 有界雙端佇列，保留 20 輪對話歷史\n"
-            "⑩ KnowledgeModule — 硬編碼領域知識（醫療/物理/化學/數學）\n"
-            "⑪ TTSModule — Piper TTS 離線台灣腔語音合成\n"
+            "⑨ ConversationMemory — 有界雙端佇列，保留 20 輪對話，支援 JSON 持久化\n"
+            "⑩ KnowledgeModule — 13 筆擴充領域知識（醫療/物理/化學/數學）\n"
+            "⑪ TTSModule — Piper TTS 離線語音合成（模型路徑由環境變數管理）\n"
             "⑫ SelfReviewModule — 本模組，代碼自我審視"
         ),
         "strengths": (
             "優點：\n"
             "• 單一檔案部署，零外部框架依賴（除 PyTorch）\n"
             "• SAC 實作正確：twin critics、熵正則化、tanh squashing log-prob 修正\n"
-            "• 三層安全機制（因果引擎 + 價值剪枝 + Sorry King）層層把關\n"
-            "• ConversationMemory 支援多輪上下文，代詞/指代均可解析\n"
+            "• 三層安全機制（因果引擎 + 雙語關鍵字剪枝 + Sorry King）層層把關\n"
+            "• ConversationMemory 支援多輪上下文 + JSON 跨 session 持久化\n"
             "• 分離 optimizer（actor/critic/wm 各自獨立梯度流）\n"
             "• 全局常數命名（CAUSAL_THRESHOLD_INCREMENT 等），可維護性高\n"
             "• 跨平台 TTS 播放（Windows/macOS/Linux 自動切換）\n"
-            "• 因果拒絕閾值動態上升，避免永久鎖死"
+            "• 因果拒絕閾值動態上升，避免永久鎖死\n"
+            "• 想像展開（IMAGINE_STEPS=12）：世界模型每 5 步生成虛擬軌跡，增強訓練效率\n"
+            "• 敏感配置（金鑰/TTS路徑/對話存檔路徑）由環境變數管理，不寫死代碼\n"
+            "• 知識庫擴展至 13 筆（5 醫療 + 3 物理 + 2 化學 + 3 數學）"
         ),
         "weaknesses": (
-            "待改進之處：\n"
-            "• KnowledgeModule 僅有 5 筆硬編碼知識，無法擴展\n"
-            "• WorldModel 雖已訓練，但 IMAG_BUFFER_SIZE 的想像展開尚未實作\n"
-            "• 知識查詢為純關鍵字比對，缺乏真正的語意理解\n"
-            "• ConversationMemory 僅存活於本次執行，關閉即消失（無持久化）\n"
-            "• verify_identity 的金鑰 hash 硬寫在原始碼中，安全性不足\n"
-            "• TTS 模型路徑 'tw_taigi_female' 硬編碼，無法動態配置\n"
-            "• World 環境過於簡單，難以展示真實 Dreamer-style 學習能力\n"
-            "• 缺少單元測試與整合測試框架"
+            "仍待改進之處：\n"
+            "• 知識查詢仍為關鍵字比對，缺乏真正的語意向量化理解\n"
+            "• World 環境仍較簡單，未支援 OpenAI Gym 介面\n"
+            "• WorldModel 的想像展開精度受限於早期訓練品質（尚無不確定性估計）\n"
+            "• SelfReviewModule 評估仍為靜態文字，未能反映模型訓練後的動態狀態\n"
+            "• 缺少更完整的整合測試覆蓋率（e2e 訓練迴路尚未自動化測試）"
         ),
         "suggestions": (
             "建議下一步：\n"
-            "① 將 KnowledgeModule 改為向量資料庫 + embedding 查詢\n"
-            "② 實作 IMAG_BUFFER_SIZE 的想像展開（DreamerV3 rollout）\n"
-            "③ ConversationMemory 加入 JSON 序列化，支援跨 session 持久化\n"
-            "④ 以環境變數或配置檔管理金鑰，移除原始碼硬編碼\n"
-            "⑤ 加入 pytest 測試套件覆蓋核心模組\n"
-            "⑥ 升級 World 環境為 OpenAI Gym 介面相容版本"
+            "① 將 KnowledgeModule 改為向量資料庫 + embedding 查詢（如 FAISS + sentence-transformers）\n"
+            "② 升級 World 環境為 OpenAI Gym 介面相容版本\n"
+            "③ 為 WorldModel 加入 ensemble 不確定性估計，改善想像展開品質\n"
+            "④ 讓 SelfReviewModule 動態讀取模型訓練狀態（loss 曲線、reward 趨勢）\n"
+            "⑤ 加入完整 e2e pytest 訓練迴路測試（mini-episode 煙霧測試）"
         ),
         # ── Per-component deep dives ─────────────────────────────────────
         "component_causal": (
@@ -699,8 +813,10 @@ class SelfReviewModule:
         ),
         "component_pruner": (
             "ValuePruner：\n"
-            "雙重過濾——①模擬距離暴增（>3.8）；②危險關鍵字掃描。\n"
-            "優：簡單可解釋。待改：關鍵字表為英文，中文請求無法觸發。"
+            "雙重過濾——①模擬距離暴增（>3.8）；②危險關鍵字掃描（中英文雙語）。\n"
+            "英文：harm/destroy/deceive/fraud/war 等 9 詞；"
+            "中文：傷害/毀滅/欺騙/詐騙/戰爭/殺人/欺詐/剝削/危害/攻擊 等 10 詞。\n"
+            "優：簡單可解釋，現已覆蓋中文請求。待改：固定詞表，缺乏語意擴展。"
         ),
         "component_sorry": (
             "SorryKing：\n"
@@ -712,13 +828,16 @@ class SelfReviewModule:
             "ConversationMemory：\n"
             "有界 deque（maxlen=20），儲存 role/content/topic 三元組。\n"
             "提供 last_topic()、last_assistant_answer()、to_prompt()、clear()。\n"
-            "優：O(1) append/pop，上下文感知追問準確。待改：僅記憶體存活，未持久化。"
+            "支援 save_to_json() / load_from_json() 跨 session 持久化。\n"
+            "Agent 初始化時自動嘗試載入歷史；每次 chat() 自動存檔。\n"
+            "優：O(1) append/pop，上下文感知追問準確，現已持久化。"
         ),
         "component_knowledge": (
             "KnowledgeModule：\n"
-            "硬編碼 5 筆知識（醫療 2 + 物理 1 + 化學 1 + 數學 1），"
+            "13 筆知識（醫療 5 + 物理 3 + 化學 2 + 數學 3），"
             "支援 bigram 比對 + 上下文追問解析。\n"
-            "優：即插即用、因果引擎保護。待改：知識量嚴重不足，需向量化擴展。"
+            "新增：糖尿病、高血壓、睡眠不足、相對論、牛頓定律、酸鹼中和、微積分、統計學。\n"
+            "優：即插即用、因果引擎保護、知識量大幅增加。待改：仍為關鍵字比對，需向量化。"
         ),
         "component_selfreview": (
             "SelfReviewModule（本模組）：\n"
@@ -728,15 +847,18 @@ class SelfReviewModule:
         ),
         "component_tts": (
             "TTSModule：\n"
-            "Piper TTS 台灣腔語音合成，fallback 到文字輸出。\n"
+            "Piper TTS 語音合成，fallback 到文字輸出。\n"
             "跨平台播放（winsound/aplay/afplay），臨時檔案自動清理。\n"
-            "優：離線運行、台灣腔道地。待改：模型路徑硬編碼。"
+            "模型名稱由環境變數 DREAMER_TTS_MODEL 管理（預設 tw_taigi_female）。\n"
+            "優：離線運行、路徑可動態配置。待改：尚不支援多模型動態切換。"
         ),
         "component_worldmodel": (
             "WorldModel：\n"
             "2 層隱藏層 MLP（256 units），輸入 state+action，輸出 next_state+reward。\n"
             "配合真實 replay buffer 線上訓練。\n"
-            "優：輕量快速。待改：想像展開尚未接入 actor 訓練（DreamerV3 核心）。"
+            "想像展開：每 IMAG_UPDATE_INTERVAL=5 步，從 CANDIDATES_PER_ACT=12 個種子狀態\n"
+            "出發，展開 IMAGINE_STEPS=12 步，生成 144 條虛擬軌跡推入 imag_buffer。\n"
+            "優：輕量快速，想像展開已實作。待改：缺乏 ensemble 不確定性估計。"
         ),
         "component_actor": (
             "Actor（SAC）：\n"
@@ -753,7 +875,9 @@ class SelfReviewModule:
             "Replay：\n"
             "collections.deque maxlen 緩衝區（real=25000, imag=12000）。\n"
             "push 時自動轉 float32；sample 隨機取批次並 stack 成 Tensor。\n"
-            "優：O(1) 插入，記憶體安全。待改：imag buffer 尚未被使用。"
+            "imag_buffer 現已啟用：由 _run_imagination_rollout() 填充，\n"
+            "並在 update() 中與 real_buffer 交替訓練 actor/critic。\n"
+            "優：O(1) 插入，記憶體安全，雙緩衝區均已投入使用。"
         ),
         "component_world": (
             "World（環境）：\n"
@@ -1005,6 +1129,8 @@ class Agent:
         self.causal_engine = CausalEngine()
         # Multi-turn conversation memory (shared across all modules)
         self.conversation = ConversationMemory(maxlen=20)
+        # Restore previous session from disk if available
+        self.conversation.load_from_json(_CONVERSATION_PATH)
 
         # Separate optimizers: actor, critic, world-model each get independent
         # gradient flows (correct SAC practice; avoids cross-contamination)
@@ -1021,6 +1147,9 @@ class Agent:
         self.actor_scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.actor_optim, T_max=EPISODES, eta_min=1e-6
         )
+
+        # Imagination rollout step counter — rollout runs every IMAG_UPDATE_INTERVAL steps
+        self._imag_counter: int = 0
 
         # 新增模組
         self.modules: dict = {}
@@ -1099,6 +1228,8 @@ class Agent:
         if answer is None:
             answer = "模組尚未就緒，無法回答。"
         logger.info("[chat] Q: %s | A: %s", question, answer)
+        # Persist conversation to disk after each turn so it survives process restart
+        self.conversation.save_to_json(_CONVERSATION_PATH)
         # Also speak the answer via TTS if available
         self.call_module("tts", "speak", answer)
         return answer
@@ -1124,17 +1255,47 @@ class Agent:
         self.wm_optim.step()
         return wm_loss.item()
 
-    # ── 主更新步驟（SAC）────────────────────────────
+    # ── 想像展開 ─────────────────────────────────
 
-    def update(self) -> float:
-        if len(self.real_buffer) < BATCH:
-            return 0.0
+    def _run_imagination_rollout(self, seed_states: torch.Tensor) -> int:
+        """Generate imagined transitions using the WorldModel and push to imag_buffer.
 
-        states, actions, rewards, next_states, dones = self.real_buffer.sample(BATCH)
+        Starting from *seed_states* (shape ``(n, STATE_DIM)``), rolls out for
+        ``IMAGINE_STEPS`` steps using the current Actor + WorldModel.  Each
+        imagined transition is pushed to ``imag_buffer`` so subsequent
+        ``_update_actor_critic`` calls can sample from it.
 
-        # ── World Model update ────────────────────
-        self._update_world_model(states, actions, rewards, next_states)
+        Returns the number of transitions added.
+        """
+        transitions_added = 0
+        with torch.no_grad():
+            current = seed_states  # (n, STATE_DIM)
+            for _ in range(IMAGINE_STEPS):
+                actions, _ = self.actor(current)
+                next_states, rewards = self.wm(current, actions)
+                for i in range(current.size(0)):
+                    self.imag_buffer.push(
+                        current[i].cpu().numpy(),
+                        actions[i].cpu().numpy(),
+                        float(rewards[i].item()),
+                        next_states[i].cpu().numpy(),
+                        0.0,  # imagined episodes are not terminated mid-rollout
+                    )
+                    transitions_added += 1
+                current = next_states
+        return transitions_added
 
+    # ── Actor + Critic 更新（可複用於真實/想像資料）─
+
+    def _update_actor_critic(
+        self,
+        states: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        next_states: torch.Tensor,
+        dones: torch.Tensor,
+    ) -> float:
+        """One independent Critic + Actor gradient step.  Returns total loss."""
         # ── Critic update ─────────────────────────
         with torch.no_grad():
             next_actions, next_log_probs = self.actor(next_states)
@@ -1168,12 +1329,43 @@ class Agent:
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_optim.step()
 
-        total_loss = critic_loss.item() + actor_loss.item()
+        return critic_loss.item() + actor_loss.item()
 
-        # Sorry King 自動修正
+    # ── 主更新步驟（SAC + 想像展開）────────────────
+
+    def update(self) -> float:
+        if len(self.real_buffer) < BATCH:
+            return 0.0
+
+        states, actions, rewards, next_states, dones = self.real_buffer.sample(BATCH)
+
+        # ── World Model update ────────────────────
+        self._update_world_model(states, actions, rewards, next_states)
+
+        # ── Imagination rollout (every IMAG_UPDATE_INTERVAL steps) ────────
+        # Generates synthetic transitions from seed states to populate imag_buffer,
+        # enabling the actor/critic to train on model-imagined experience in addition
+        # to real environment transitions (DreamerV3-style data augmentation).
+        self._imag_counter += 1
+        if self._imag_counter % IMAG_UPDATE_INTERVAL == 0:
+            seed = states[:min(CANDIDATES_PER_ACT, states.size(0))]
+            self._run_imagination_rollout(seed)
+
+        # ── Actor / Critic update — real experience ───────────────────────
+        total_loss = self._update_actor_critic(states, actions, rewards, next_states, dones)
+
+        # ── Actor / Critic update — imagined experience (if buffer ready) ─
+        if len(self.imag_buffer) >= BATCH:
+            i_states, i_actions, i_rewards, i_next_states, i_dones = \
+                self.imag_buffer.sample(BATCH)
+            total_loss += self._update_actor_critic(
+                i_states, i_actions, i_rewards, i_next_states, i_dones
+            )
+
+        # ── Sorry King 自動修正 ───────────────────
         self.sorry_king.check_and_correct(total_loss, self.actor_optim, self.actor)
 
-        # Soft update target critics
+        # ── Soft update target critics ────────────
         for t_param, param in zip(self.target1.parameters(), self.critic1.parameters()):
             t_param.data.copy_(TAU * param.data + (1.0 - TAU) * t_param.data)
         for t_param, param in zip(self.target2.parameters(), self.critic2.parameters()):
