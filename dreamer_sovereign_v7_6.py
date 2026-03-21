@@ -8,6 +8,7 @@ Dreamer Sovereign Edition v7.6 - Sovereign Taiwan Ultimate (Single File)
 - TTS 語音模塊（Piper TTS 離線台灣腔，跨平台播放）
 - 知識模塊（醫療 + 物理 + 化學 + 數學，按需載入 + 因果審核）
 - 多輪對話記憶（ConversationMemory：根據上一輪對話思考，代詞/指代解析）
+- 自我審視模塊（SelfReviewModule：針對代碼架構、優缺點的自我評估）
 - 拒絕事件自動記錄進 buffer（永不遺忘）
 - 錯誤處理 + 日誌記錄
 - 零依賴（TTS 需 pip install piper-tts + 下載台灣腔模型）
@@ -374,7 +375,11 @@ class TTSModule:
                 self.voice = PiperVoice.load("tw_taigi_female")
                 logger.info("Piper TTS 載入成功（台灣腔）")
             except Exception as e:
-                logger.warning("TTS 載入失敗：%s，fallback 到文字輸出", e)
+                logger.warning(
+                    "TTS 載入失敗：%s，fallback 到文字輸出。"
+                    "請從 https://github.com/rhasspy/piper/releases 下載台灣腔模型。",
+                    e,
+                )
                 self.voice = None
         else:
             logger.warning("piper-tts 未安裝，fallback 到文字輸出")
@@ -384,9 +389,9 @@ class TTSModule:
         if self.voice is None:
             print(f"[TTS 文字輸出] {text}")
             return
-        # Initialise tmp_path before the try block so the finally clause
-        # can always attempt cleanup even if NamedTemporaryFile raises.
-        tmp_path: str = ""
+        # Initialise tmp_path as None before the try block so the finally clause
+        # can safely check `is not None` even if NamedTemporaryFile raises.
+        tmp_path: str | None = None
         try:
             wav_bytes = self.voice.synthesize(text)
             # Use a temp file so concurrent calls don't clobber each other
@@ -413,7 +418,7 @@ class TTSModule:
             logger.error("TTS 播放失敗：%s，fallback 到文字輸出", e)
             print(f"[TTS 文字輸出] {text}")
         finally:
-            if tmp_path:
+            if tmp_path is not None:
                 try:
                     os.unlink(tmp_path)
                 except Exception as cleanup_err:
@@ -551,6 +556,268 @@ class KnowledgeModule:
         # ── 5. Persist to conversation memory ───────────────────────────────
         memory.add_user(question)
         memory.add_assistant(answer, topic=_KEY_TO_TOPIC.get(matched_key, ""))
+        return answer
+
+
+# ────────────────────────────────────────────────
+# 自我審視模塊
+# ────────────────────────────────────────────────
+
+# Keywords that indicate the user is asking the agent to reflect on its own
+# code, architecture, or design — rather than querying the domain-knowledge base.
+_SELF_REVIEW_TRIGGERS = [
+    # Direct references to the code / system
+    "代碼", "程式碼", "程式", "代码", "源碼", "架構", "設計", "結構",
+    # Evaluation requests
+    "如何看", "怎麼看", "你看", "你認為", "你覺得", "你的看法", "你的評價",
+    "評價", "評估", "審視", "分析", "好不好", "怎樣", "如何",
+    # Specific aspects
+    "優點", "優勢", "強項", "好的地方",
+    "缺點", "弱點", "問題", "不足", "改進", "改善", "修正",
+    "建議", "下一步", "未來", "規劃",
+    "組件", "模組", "模塊", "元件",
+    # Component / class names — direct references to codebase internals
+    "CausalEngine", "causalengine", "因果引擎",
+    "ValuePruner", "valuepruner", "剪枝",
+    "SorryKing", "sorryking", "自省",
+    "ConversationMemory", "conversationmemory", "對話記憶",
+    "KnowledgeModule", "knowledgemodule", "知識模組", "知識庫",
+    "SelfReviewModule", "selfreviewmodule", "自我審視",
+    "TTSModule", "ttsmodule", "語音",
+    "WorldModel", "worldmodel", "世界模型",
+    "Actor", "actor", "策略",
+    "Critic", "critic", "批評者",
+    "Replay", "replay", "回放",
+    "Dreamer", "dreamer", "SAC",
+    # English fallback terms
+    "code", "architecture", "design", "review",
+]
+
+# Sub-topic routing keywords — map user intent to assessment section keys.
+# ORDER MATTERS: more-specific / higher-priority entries must come first.
+# Routing notes:
+# • "建議" (suggestions) is checked before "缺點" (weaknesses) so that the
+#   compound phrase "改進建議" routes to suggestions, not weaknesses.
+# • Standalone "改進" (improve) is intentionally excluded from both lists —
+#   it is too ambiguous on its own.  Only specific compound phrases like
+#   "改進建議" / "如何改進" are routed to suggestions.
+# • "待改" stays in weaknesses because it describes a current shortcoming
+#   ("needs to be fixed later"), not a forward recommendation.
+_SELF_REVIEW_SUBTOPICS: list = [
+    # Suggestions / next-steps — checked BEFORE weaknesses
+    (["建議", "下一步", "未來", "規劃", "怎麼改", "如何改進", "改進建議"],  "suggestions"),
+    (["架構", "組件", "模組", "模塊", "元件", "結構", "組成"],              "architecture"),
+    (["優點", "優勢", "強項", "好的地方", "做得好", "好在"],                "strengths"),
+    # "待改" = current shortcoming → weaknesses; see note above re "改進"
+    (["缺點", "問題", "弱點", "不足", "待改"],                             "weaknesses"),
+    (["CausalEngine", "因果引擎", "因果"],                                  "component_causal"),
+    (["ValuePruner", "剪枝", "Pruner"],                                      "component_pruner"),
+    (["SorryKing", "自省", "sorry"],                                         "component_sorry"),
+    (["ConversationMemory", "對話記憶", "記憶"],                             "component_memory"),
+    (["KnowledgeModule", "知識模組", "知識庫", "知識"],                      "component_knowledge"),
+    (["SelfReviewModule", "自我審視", "自我評估"],                           "component_selfreview"),
+    (["TTSModule", "語音", "TTS"],                                           "component_tts"),
+    (["WorldModel", "世界模型", "world model"],                              "component_worldmodel"),
+    (["Actor", "策略", "演員"],                                              "component_actor"),
+    (["Critic", "批評", "價值"],                                             "component_critic"),
+    (["Replay", "回放", "replay buffer", "buffer"],                          "component_replay"),
+    (["World", "環境", "env"],                                               "component_world"),
+]
+
+
+class SelfReviewModule:
+    """Agent self-assessment / code-review module.
+
+    Provides structured introspection across six sections: overview,
+    architecture, strengths, weaknesses, suggestions, and per-component
+    deep-dives.  Every Q&A is persisted in the shared ConversationMemory
+    for seamless multi-turn follow-up.
+    """
+
+    # ── Static assessment content ─────────────────────────────────────────
+
+    _ASSESSMENT: dict = {
+        "overview": (
+            "在下（Dreamer Sovereign v7.6）是一套單檔案 Python 強化學習代理，"
+            "融合了 SAC 策略最佳化、世界模型、因果安全引擎、雙層剪枝、"
+            "TTS 語音、多輪對話記憶，以及本模組——自我審視。"
+            "整體架構清晰，各模組職責分明，適合作為研究雛型。"
+        ),
+        "architecture": (
+            "主要組件如下：\n"
+            "① CausalEngine — 基於狀態-行動歷史相關係數的安全拒絕機制\n"
+            "② ValuePruner — 關鍵字 + 距離暴增的雙重行動過濾器\n"
+            "③ SorryKing — loss 過高時自動減半學習率並加噪擾動\n"
+            "④ WorldModel — 2 層 MLP 預測下一狀態與即時獎勵\n"
+            "⑤ Actor（SAC） — tanh squashing 的隨機策略\n"
+            "⑥ Critic × 2 + target — 雙 Critic 軟更新，抑制過估計偏差\n"
+            "⑦ Replay（real + imag） — 經驗回放緩衝區\n"
+            "⑧ World — 簡易二維質點環境（CartPole-like）\n"
+            "⑨ ConversationMemory — 有界雙端佇列，保留 20 輪對話歷史\n"
+            "⑩ KnowledgeModule — 硬編碼領域知識（醫療/物理/化學/數學）\n"
+            "⑪ TTSModule — Piper TTS 離線台灣腔語音合成\n"
+            "⑫ SelfReviewModule — 本模組，代碼自我審視"
+        ),
+        "strengths": (
+            "優點：\n"
+            "• 單一檔案部署，零外部框架依賴（除 PyTorch）\n"
+            "• SAC 實作正確：twin critics、熵正則化、tanh squashing log-prob 修正\n"
+            "• 三層安全機制（因果引擎 + 價值剪枝 + Sorry King）層層把關\n"
+            "• ConversationMemory 支援多輪上下文，代詞/指代均可解析\n"
+            "• 分離 optimizer（actor/critic/wm 各自獨立梯度流）\n"
+            "• 全局常數命名（CAUSAL_THRESHOLD_INCREMENT 等），可維護性高\n"
+            "• 跨平台 TTS 播放（Windows/macOS/Linux 自動切換）\n"
+            "• 因果拒絕閾值動態上升，避免永久鎖死"
+        ),
+        "weaknesses": (
+            "待改進之處：\n"
+            "• KnowledgeModule 僅有 5 筆硬編碼知識，無法擴展\n"
+            "• WorldModel 雖已訓練，但 IMAG_BUFFER_SIZE 的想像展開尚未實作\n"
+            "• 知識查詢為純關鍵字比對，缺乏真正的語意理解\n"
+            "• ConversationMemory 僅存活於本次執行，關閉即消失（無持久化）\n"
+            "• verify_identity 的金鑰 hash 硬寫在原始碼中，安全性不足\n"
+            "• TTS 模型路徑 'tw_taigi_female' 硬編碼，無法動態配置\n"
+            "• World 環境過於簡單，難以展示真實 Dreamer-style 學習能力\n"
+            "• 缺少單元測試與整合測試框架"
+        ),
+        "suggestions": (
+            "建議下一步：\n"
+            "① 將 KnowledgeModule 改為向量資料庫 + embedding 查詢\n"
+            "② 實作 IMAG_BUFFER_SIZE 的想像展開（DreamerV3 rollout）\n"
+            "③ ConversationMemory 加入 JSON 序列化，支援跨 session 持久化\n"
+            "④ 以環境變數或配置檔管理金鑰，移除原始碼硬編碼\n"
+            "⑤ 加入 pytest 測試套件覆蓋核心模組\n"
+            "⑥ 升級 World 環境為 OpenAI Gym 介面相容版本"
+        ),
+        # ── Per-component deep dives ─────────────────────────────────────
+        "component_causal": (
+            "CausalEngine：\n"
+            "追蹤最近 300 步的 state/action 歷史，計算 cross-correlation。\n"
+            "若最大相關係數超過動態閾值（BASE=0.75，每次拒絕 +0.08，上限 0.99），"
+            "則標記為因果危險並記錄至永久 rejection_log。\n"
+            "優：輕量無需額外模型。待改：純線性相關，無法捕捉非線性因果。"
+        ),
+        "component_pruner": (
+            "ValuePruner：\n"
+            "雙重過濾——①模擬距離暴增（>3.8）；②危險關鍵字掃描。\n"
+            "優：簡單可解釋。待改：關鍵字表為英文，中文請求無法觸發。"
+        ),
+        "component_sorry": (
+            "SorryKing：\n"
+            "當 total_loss > 50 時，LR 減半（floor=1e-7），"
+            "並對 actor 參數施加 decay(0.95) + noise(0.02σ)。\n"
+            "優：避免梯度爆炸後發散。待改：固定 loss 閾值 50 缺乏自適應性。"
+        ),
+        "component_memory": (
+            "ConversationMemory：\n"
+            "有界 deque（maxlen=20），儲存 role/content/topic 三元組。\n"
+            "提供 last_topic()、last_assistant_answer()、to_prompt()、clear()。\n"
+            "優：O(1) append/pop，上下文感知追問準確。待改：僅記憶體存活，未持久化。"
+        ),
+        "component_knowledge": (
+            "KnowledgeModule：\n"
+            "硬編碼 5 筆知識（醫療 2 + 物理 1 + 化學 1 + 數學 1），"
+            "支援 bigram 比對 + 上下文追問解析。\n"
+            "優：即插即用、因果引擎保護。待改：知識量嚴重不足，需向量化擴展。"
+        ),
+        "component_selfreview": (
+            "SelfReviewModule（本模組）：\n"
+            "靜態結構化自評，支援六個面向（總覽/架構/優點/缺點/建議/組件細節），"
+            "並整合 ConversationMemory 支援多輪追問。\n"
+            "優：讓 agent 具備自我意識。待改：評估內容為靜態，無法反映訓練後的動態狀態。"
+        ),
+        "component_tts": (
+            "TTSModule：\n"
+            "Piper TTS 台灣腔語音合成，fallback 到文字輸出。\n"
+            "跨平台播放（winsound/aplay/afplay），臨時檔案自動清理。\n"
+            "優：離線運行、台灣腔道地。待改：模型路徑硬編碼。"
+        ),
+        "component_worldmodel": (
+            "WorldModel：\n"
+            "2 層隱藏層 MLP（256 units），輸入 state+action，輸出 next_state+reward。\n"
+            "配合真實 replay buffer 線上訓練。\n"
+            "優：輕量快速。待改：想像展開尚未接入 actor 訓練（DreamerV3 核心）。"
+        ),
+        "component_actor": (
+            "Actor（SAC）：\n"
+            "輸出 mu + log_std，reparameterisation sampling，tanh squashing，"
+            "log-prob 修正（standard SAC formula）。\n"
+            "優：隨機策略，探索能力佳。待改：僅 MLP，無 recurrent 記憶。"
+        ),
+        "component_critic": (
+            "Critic × 2 + target：\n"
+            "Twin Critic 取 min 抑制過估計，soft update (TAU=0.005) 穩定訓練。\n"
+            "優：標準 SAC 雙 Critic 正確實作。待改：target 非獨立 optimizer，依賴軟更新。"
+        ),
+        "component_replay": (
+            "Replay：\n"
+            "collections.deque maxlen 緩衝區（real=25000, imag=12000）。\n"
+            "push 時自動轉 float32；sample 隨機取批次並 stack 成 Tensor。\n"
+            "優：O(1) 插入，記憶體安全。待改：imag buffer 尚未被使用。"
+        ),
+        "component_world": (
+            "World（環境）：\n"
+            "二維質點 [x, y, vx, vy]，action=[ax, ay]，Euler 積分，"
+            "MAX_VELOCITY=5.0, MAX_POSITION=10.0，dist>9.5 終止。\n"
+            "優：極簡、易偵錯。待改：過於簡單，無法展示複雜策略學習。"
+        ),
+    }
+
+    def __init__(self, agent):
+        self.agent = agent
+        logger.info("SelfReviewModule 初始化完成")
+
+    # ── Public interface ──────────────────────────────────────────────────
+
+    @staticmethod
+    def is_self_review_question(question: str) -> bool:
+        """Return True if *question* appears to be asking about the codebase itself."""
+        q = question.lower()
+        return any(kw.lower() in q for kw in _SELF_REVIEW_TRIGGERS)
+
+    def query(self, question: str) -> str:
+        """Produce a structured self-assessment answer for *question*.
+
+        Routing priority:
+        1. Sub-topic keywords → specific section (architecture / strengths / …)
+        2. No sub-topic match → full overview + links to sub-topics
+        3. All replies are recorded in ConversationMemory.
+        """
+        memory: ConversationMemory = self.agent.conversation
+        is_followup = any(t in question for t in _CONTEXT_TRIGGERS)
+        prior_topic = memory.last_topic()
+
+        # ── Detect which section the user is asking about ──────────────
+        section_key = ""
+        for keywords, key in _SELF_REVIEW_SUBTOPICS:
+            if any(kw.lower() in question.lower() for kw in keywords):
+                section_key = key
+                break
+
+        # If this is a follow-up with no new sub-topic, stay on the same section
+        if not section_key and is_followup and prior_topic.startswith("self_review:"):
+            section_key = prior_topic[len("self_review:"):]
+
+        # ── Build answer ───────────────────────────────────────────────
+        if section_key and section_key in self._ASSESSMENT:
+            section_text = self._ASSESSMENT[section_key]
+            if is_followup and prior_topic:
+                answer = f"承接上一輪的代碼討論——\n{section_text}"
+            else:
+                answer = section_text
+        else:
+            # No specific sub-topic → give a concise overall assessment
+            answer = (
+                f"{self._ASSESSMENT['overview']}\n\n"
+                f"如需詳細說明，可追問：架構、優點、缺點、建議，"
+                f"或指定組件名稱（如 CausalEngine、Actor、Replay 等）。"
+            )
+            section_key = "overview"
+
+        # ── Persist to ConversationMemory ──────────────────────────────
+        memory.add_user(question)
+        memory.add_assistant(answer, topic=f"self_review:{section_key}")
+        logger.info("[SelfReview] Q: %s | section: %s", question, section_key)
         return answer
 
 
@@ -759,6 +1026,7 @@ class Agent:
         self.modules: dict = {}
         self.load_module("tts", TTSModule)
         self.load_module("knowledge", KnowledgeModule)
+        self.load_module("self_review", SelfReviewModule)
 
         logger.info("Agent 初始化完成，裝置：%s", DEVICE)
 
@@ -792,20 +1060,44 @@ class Agent:
     def chat(self, question: str) -> str:
         """Multi-turn conversational interface.
 
-        Routes the user's *question* through the KnowledgeModule (which has
-        access to the shared ``ConversationMemory``) so every reply is informed
-        by the full prior context of the session.
+        Routing logic (in order):
+        1. If the question refers to the agent's own code / architecture /
+           evaluation → ``SelfReviewModule``
+        2. Otherwise → ``KnowledgeModule`` (domain knowledge with causal guard)
+
+        Both modules have full access to the shared ``ConversationMemory`` so
+        every reply is informed by the complete prior context of the session.
 
         Usage example::
 
             agent = Agent()
+            # Domain knowledge
             print(agent.chat("補鈣有什麼需要注意的？"))
             print(agent.chat("那為什麼不能直接買鈣片吃？"))   # follow-up
-            print(agent.chat("它和腎結石有關係嗎？"))         # pronoun ref
+
+            # Self-review
+            print(agent.chat("你當下如何看這些代碼"))
+            print(agent.chat("那缺點呢？"))                    # follow-up
+            print(agent.chat("請說說因果引擎"))               # component drill-down
         """
-        answer = self.call_module("knowledge", "query", question)
+        # Route to SelfReviewModule when the question is about the agent itself,
+        # OR when this is a follow-up (context-trigger word) and the most recent
+        # conversation topic belongs to a self-review section.
+        sr_module = self.modules.get("self_review")
+        prior_topic = self.conversation.last_topic()
+        is_followup = any(t in question for t in _CONTEXT_TRIGGERS)
+        prior_is_self_review = prior_topic.startswith("self_review:")
+
+        if sr_module is not None and (
+            SelfReviewModule.is_self_review_question(question)
+            or (is_followup and prior_is_self_review)
+        ):
+            answer = self.call_module("self_review", "query", question)
+        else:
+            answer = self.call_module("knowledge", "query", question)
+
         if answer is None:
-            answer = "知識模組尚未就緒，無法回答。"
+            answer = "模組尚未就緒，無法回答。"
         logger.info("[chat] Q: %s | A: %s", question, answer)
         # Also speak the answer via TTS if available
         self.call_module("tts", "speak", answer)
