@@ -1,7 +1,9 @@
 """
 Pytest test suite for dreamer_sovereign_v7_6.py
 
-Covers the fixes introduced in the "請針對問題優化修正到完美" PR:
+Covers the fixes introduced across two PRs:
+
+PR #1 ("Add 因果裁斷 pre-fetch causal filter"):
   1. USER_KEY_HASH loaded from DREAMER_KEY_HASH env var
   2. TTS model path loaded from DREAMER_TTS_MODEL env var
   3. ConversationMemory JSON persistence (save_to_json / load_from_json)
@@ -13,6 +15,12 @@ Covers the fixes introduced in the "請針對問題優化修正到完美" PR:
   9. Agent.chat() auto-saves conversation history
  10. WikipediaAdapter — encyclopedic fallback (mocked network)
  11. KnowledgeModule Wikipedia Tier 2 fallback
+
+Production-readiness PR (this PR — "Make PR #1 production-ready"):
+ 12. Build artifact removed; .gitignore extended with *.py[cod]
+ 13. WikipediaAdapter true LRU eviction via OrderedDict
+ 14. ValuePruner.is_query_safe() keyword normalization (kw.lower())
+ 15. KnowledgeModule.query() single-path memory persistence (no double writes)
 """
 
 import hashlib
