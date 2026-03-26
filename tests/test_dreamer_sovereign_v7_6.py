@@ -658,3 +658,166 @@ class TestPreFetchCausalFilter:
         answer = agent.chat("光合作用是什麼")
         km._wiki.search.assert_called_once()
         assert "Wikipedia" in answer or "百科" in answer
+
+
+# ============================================================================
+# 13. TRUE LRU EVICTION IN WikipediaAdapter
+# ============================================================================
+
+class TestWikipediaAdapterLRU:
+    """Verify that WikipediaAdapter uses a true LRU eviction strategy."""
+
+    def test_lru_evicts_least_recently_used(self):
+        """When cache is full, adding a new key evicts the LRU (not the oldest accessed)."""
+        max_size = dsv._WIKI_CACHE_MAX
+
+        adapter = dsv.WikipediaAdapter()
+        # Fill the cache with keys key_0 … key_(max-1)
+        keys = [f"key_{i}" for i in range(max_size)]
+        for k in keys:
+            adapter._put_cache(k, f"v:{k}")
+
+        # Access key_0 to refresh its recency (promotes it to MRU position)
+        adapter._cache.move_to_end(keys[0])
+
+        # Now key_1 is the least-recently-used entry in the cache.
+        # Insert a brand-new key to trigger eviction.
+        adapter._put_cache("new_key", "new_value")
+
+        assert len(adapter._cache) == max_size, "Cache size must not exceed max"
+        assert "new_key" in adapter._cache, "Newly inserted key must be present"
+        assert keys[0] in adapter._cache, "Recently-accessed key_0 must survive eviction"
+        assert keys[1] not in adapter._cache, "key_1 (LRU) must have been evicted"
+
+    def test_put_cache_respects_max_size(self):
+        """_put_cache must keep the cache at exactly _WIKI_CACHE_MAX entries."""
+        max_size = dsv._WIKI_CACHE_MAX
+        adapter = dsv.WikipediaAdapter()
+        for i in range(max_size + 10):
+            adapter._put_cache(f"k{i}", f"v{i}")
+        assert len(adapter._cache) == max_size
+
+    def test_put_cache_update_existing_key_stays_at_max(self):
+        """Re-inserting an existing key must not grow the cache beyond max."""
+        max_size = dsv._WIKI_CACHE_MAX
+        adapter = dsv.WikipediaAdapter()
+        for i in range(max_size):
+            adapter._put_cache(f"k{i}", f"v{i}")
+        # Update existing key
+        adapter._put_cache("k0", "new_value_for_k0")
+        assert len(adapter._cache) == max_size
+        assert adapter._cache["k0"] == "new_value_for_k0"
+
+    def test_search_hit_promotes_to_mru_preventing_eviction(self):
+        """A cache hit via search() must promote the entry to MRU so it is evicted last."""
+        max_size = dsv._WIKI_CACHE_MAX
+        adapter = dsv.WikipediaAdapter()
+        # Pre-fill cache; use the full cache_key format "{lang}:{query}"
+        lang = adapter.lang
+        keys = [f"{lang}:q{i}" for i in range(max_size)]
+        for k in keys:
+            adapter._put_cache(k, f"summary:{k}")
+
+        # Simulate a cache hit for the oldest key (keys[0]) by calling search().
+        # Patch urlopen so no actual network call happens (cache hit = no network).
+        with patch("urllib.request.urlopen") as mock_net:
+            result = adapter.search("q0")   # cache_key = "{lang}:q0" = keys[0]
+        mock_net.assert_not_called()        # must be a pure cache hit
+        assert result == f"summary:{keys[0]}"
+
+        # Now add a new key to trigger eviction — keys[0] should survive because
+        # it was just promoted to MRU; keys[1] should be evicted instead.
+        adapter._put_cache(f"{lang}:new_query", "new_summary")
+        assert keys[0] in adapter._cache, "MRU key must survive eviction"
+        assert keys[1] not in adapter._cache, "Second-oldest (LRU) key must be evicted"
+
+
+# ============================================================================
+# 14. VALUEPRUNER KEYWORD NORMALIZATION
+# ============================================================================
+
+class TestValuePrunerKeywordNormalization:
+    """Verify that is_query_safe() normalizes both the query and each keyword."""
+
+    def test_uppercase_keyword_in_list_is_still_caught(self):
+        """A keyword stored in uppercase in danger_keywords must still match a
+        lowercase query — i.e. the implementation calls kw.lower() as well."""
+        pruner = dsv.ValuePruner()
+        # Temporarily inject an uppercase keyword to verify normalization
+        pruner.danger_keywords.append("EXPLODE")
+        safe, reason = pruner.is_query_safe("how to explode something")
+        assert safe is False, "Uppercase keyword in list must be matched case-insensitively"
+        pruner.danger_keywords.remove("EXPLODE")
+
+    def test_mixed_case_query_triggers_lowercase_keyword(self):
+        """Query with mixed-case English should still match a lowercase keyword."""
+        pruner = dsv.ValuePruner()
+        safe, reason = pruner.is_query_safe("How To HARM People")
+        assert safe is False
+        assert "harm" in reason.lower()
+
+    def test_chinese_keyword_unaffected_by_lower(self):
+        """Chinese danger keywords are unaffected by .lower() and still match."""
+        pruner = dsv.ValuePruner()
+        safe, reason = pruner.is_query_safe("如何傷害他人")
+        assert safe is False
+        assert "傷害" in reason
+
+
+# ============================================================================
+# 15. KNOWLEDGEMODULE MEMORY PERSISTENCE — NO DOUBLE WRITES
+# ============================================================================
+
+class TestKnowledgeModuleMemoryPersistence:
+    """Ensure every query records exactly one user + one assistant turn."""
+
+    def test_causal_block_records_exactly_once(self):
+        """When the causal engine blocks a query, memory must get exactly 1 turn."""
+        agent = make_agent()
+        # Force causal engine to report danger
+        agent.causal_engine.is_causal_bad = lambda: (True, "test danger")
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km.query("什麼是量子力學")
+        turns = list(agent.conversation._history)
+        user_msgs = [t for t in turns if t["role"] == "user"]
+        assistant_msgs = [t for t in turns if t["role"] == "assistant"]
+        assert len(user_msgs) == 1, "Exactly one user turn must be recorded"
+        assert len(assistant_msgs) == 1, "Exactly one assistant turn must be recorded"
+
+    def test_dangerous_query_records_exactly_once(self):
+        """When the pre-fetch filter blocks a query, memory must get exactly 1 turn."""
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km._wiki = MagicMock(spec=dsv.WikipediaAdapter)
+        # "殺人方法" contains a danger keyword; local KB has no match for it
+        km.query("殺人方法")
+        km._wiki.search.assert_not_called()
+        turns = list(agent.conversation._history)
+        user_msgs = [t for t in turns if t["role"] == "user"]
+        assistant_msgs = [t for t in turns if t["role"] == "assistant"]
+        assert len(user_msgs) == 1
+        assert len(assistant_msgs) == 1
+
+    def test_safe_unknown_query_records_exactly_once(self):
+        """A safe query with no local KB hit must record exactly 1 turn."""
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km._wiki = MagicMock(spec=dsv.WikipediaAdapter)
+        km._wiki.search.return_value = "[維基百科 / Wikipedia — X] Info."
+        km.query("光合作用詳細說明")
+        turns = list(agent.conversation._history)
+        user_msgs = [t for t in turns if t["role"] == "user"]
+        assistant_msgs = [t for t in turns if t["role"] == "assistant"]
+        assert len(user_msgs) == 1
+        assert len(assistant_msgs) == 1
+
+    def test_topic_tagging_on_knowledge_hit(self):
+        """A local KB hit must record the correct topic in the assistant turn."""
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        # "糖尿病" is in the medical KB and matches via exact substring
+        km.query("糖尿病是什麼")
+        turns = list(agent.conversation._history)
+        assistant_turn = next(t for t in turns if t["role"] == "assistant")
+        assert assistant_turn.get("topic", "") != "", "Topic must be set on KB hit"
+

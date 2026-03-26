@@ -282,7 +282,7 @@ class ValuePruner:
         """
         q_lower = query.lower()
         for kw in self.danger_keywords:
-            if kw in q_lower:
+            if kw.lower() in q_lower:
                 return False, f"查詢觸發危險關鍵字「{kw}」，拒絕抓取外部資料"
         return True, "查詢通過因果裁斷，允許抓取外部資料"
 
@@ -582,9 +582,10 @@ class WikipediaAdapter:
         self.lang: str = _WIKI_LANG
         self.timeout: int = _WIKI_TIMEOUT
         self.enabled: bool = _WIKI_ENABLED
-        # LRU cache: key = "{lang}:{query}", value = summary string
-        self._cache: dict = {}
-        self._cache_order: collections.deque = collections.deque(maxlen=_WIKI_CACHE_MAX)
+        # True LRU cache: OrderedDict preserves insertion/access order so that
+        # move_to_end() promotes a hit to MRU position and popitem(last=False)
+        # evicts the LRU entry when the cache exceeds _WIKI_CACHE_MAX.
+        self._cache: collections.OrderedDict = collections.OrderedDict()
 
     # ── Public ────────────────────────────────────────────────────────────
 
@@ -601,6 +602,8 @@ class WikipediaAdapter:
             return None
         cache_key = f"{self.lang}:{query}"
         if cache_key in self._cache:
+            # Promote to most-recently-used position.
+            self._cache.move_to_end(cache_key)
             logger.debug("[WikipediaAdapter] Cache hit: %s", query)
             return self._cache[cache_key]
 
@@ -662,14 +665,14 @@ class WikipediaAdapter:
             return None
 
     def _put_cache(self, key: str, value: str) -> None:
-        """Insert *key*→*value* into the LRU cache, evicting the oldest if full."""
-        if key not in self._cache:
-            # deque with maxlen handles eviction automatically;
-            # we only need to remove the corresponding dict entry.
-            if len(self._cache_order) == _WIKI_CACHE_MAX:
-                oldest = self._cache_order[0]   # will be auto-evicted from deque
-                self._cache.pop(oldest, None)
-            self._cache_order.append(key)
+        """Insert *key*→*value* into the LRU cache, evicting the LRU entry if full."""
+        if key in self._cache:
+            # Key already present — update value and promote to MRU.
+            self._cache.move_to_end(key)
+        else:
+            if len(self._cache) >= _WIKI_CACHE_MAX:
+                # Evict the least-recently-used entry (front of OrderedDict).
+                self._cache.popitem(last=False)
         self._cache[key] = value
 
 
@@ -771,44 +774,28 @@ class KnowledgeModule:
            ``ValuePruner.is_query_safe`` — dangerous queries are rejected
            before any external network request leaves the system boundary.
         5. If query passes the filter: Wikipedia encyclopedic fallback (Tier 2).
-        6. Record the Q&A pair into the shared ``ConversationMemory``.
+        6. Record the Q&A pair into the shared ``ConversationMemory`` exactly once.
         """
         memory: ConversationMemory = self.agent.conversation
+        matched_key = ""
 
         # ── 1. Causal safety check ──────────────────────────────────────────
         causal_bad, reason = self.agent.causal_engine.is_causal_bad()
         if causal_bad:
             answer = f"因果風險過高：{reason}，拒絕回答"
-            memory.add_user(question)
-            memory.add_assistant(answer)
-            return answer
+        else:
+            # ── 2. Detect follow-up / pronoun reference ─────────────────────
+            is_followup = any(trigger in question for trigger in _CONTEXT_TRIGGERS)
+            prior_topic = memory.last_topic()
+            prior_answer = memory.last_assistant_answer()
 
-        # ── 2. Detect follow-up / pronoun reference ─────────────────────────
-        is_followup = any(trigger in question for trigger in _CONTEXT_TRIGGERS)
-        prior_topic = memory.last_topic()
-        prior_answer = memory.last_assistant_answer()
+            # ── 3. Resolve question against knowledge base ──────────────────
+            matched_data: dict = {}
+            matched_category = ""
 
-        # ── 3. Resolve question against knowledge base ──────────────────────
-        matched_key = ""
-        matched_data: dict = {}
-        matched_category = ""
-
-        for category, items in self.knowledge.items():
-            for key, data in items.items():
-                if _key_matches(key, question):
-                    matched_key = key
-                    matched_data = data
-                    matched_category = category
-                    break
-            if matched_key:
-                break
-
-        # If no direct keyword hit but this is a follow-up, try to re-use the
-        # last discussed topic to look up its data again.
-        if not matched_key and is_followup and prior_topic:
             for category, items in self.knowledge.items():
                 for key, data in items.items():
-                    if _KEY_TO_TOPIC.get(key, "") == prior_topic:
+                    if _key_matches(key, question):
                         matched_key = key
                         matched_data = data
                         matched_category = category
@@ -816,63 +803,72 @@ class KnowledgeModule:
                 if matched_key:
                     break
 
-        # ── 4. Build answer ─────────────────────────────────────────────────
-        if matched_key:
-            topic_label = _KEY_TO_TOPIC.get(matched_key, matched_key)
-            base = (
-                f"根據私人知識庫 ({matched_category})：{matched_data['fact']}"
-                f" (來源：{matched_data['source']})"
-            )
-            if is_followup and prior_topic and prior_topic == topic_label:
-                # Explicitly tie the answer back to the previous exchange
-                answer = (
-                    f"承接上一輪關於「{prior_topic}」的討論——{base}"
+            # If no direct keyword hit but this is a follow-up, try to re-use
+            # the last discussed topic to look up its data again.
+            if not matched_key and is_followup and prior_topic:
+                for category, items in self.knowledge.items():
+                    for key, data in items.items():
+                        if _KEY_TO_TOPIC.get(key, "") == prior_topic:
+                            matched_key = key
+                            matched_data = data
+                            matched_category = category
+                            break
+                    if matched_key:
+                        break
+
+            # ── 4. Build answer ─────────────────────────────────────────────
+            if matched_key:
+                topic_label = _KEY_TO_TOPIC.get(matched_key, matched_key)
+                base = (
+                    f"根據私人知識庫 ({matched_category})：{matched_data['fact']}"
+                    f" (來源：{matched_data['source']})"
                 )
-            elif is_followup and prior_topic and prior_topic != topic_label:
-                # Follow-up but on a different topic — acknowledge the switch
+                if is_followup and prior_topic and prior_topic == topic_label:
+                    # Explicitly tie the answer back to the previous exchange
+                    answer = f"承接上一輪關於「{prior_topic}」的討論——{base}"
+                elif is_followup and prior_topic and prior_topic != topic_label:
+                    # Follow-up but on a different topic — acknowledge the switch
+                    answer = (
+                        f"（上一輪討論的是「{prior_topic}」，"
+                        f"本次回答新話題「{topic_label}」）{base}"
+                    )
+                else:
+                    answer = base
+            elif is_followup and prior_answer:
+                # No knowledge hit; echo back what we know from the last turn
                 answer = (
-                    f"（上一輪討論的是「{prior_topic}」，"
-                    f"本次回答新話題「{topic_label}」）{base}"
+                    f"針對上一輪回覆（「{prior_topic or '前述主題'}」）的追問：\n"
+                    f"在下上次提到：{prior_answer}\n"
+                    f"如需更深入說明，請主公告知具體方向。"
                 )
             else:
-                answer = base
-        elif is_followup and prior_answer:
-            # No knowledge hit; echo back what we know from the last turn
-            answer = (
-                f"針對上一輪回覆（「{prior_topic or '前述主題'}」）的追問：\n"
-                f"在下上次提到：{prior_answer}\n"
-                f"如需更深入說明，請主公告知具體方向。"
-            )
-        else:
-            # ── Pre-fetch causal filter (因果裁斷過濾) ──────────────────────
-            # Before forwarding the query to an external service (Wikipedia),
-            # run a content-based safety check through ValuePruner so that
-            # dangerous queries never leave the system boundary.
-            fetch_safe, fetch_reason = self.agent.pruner.is_query_safe(question)
-            if not fetch_safe:
-                answer = f"外部資料抓取已遭因果裁斷攔截：{fetch_reason}"
-                logger.warning(
-                    "[KnowledgeModule] 因果裁斷攔截外部查詢：%s | %s",
-                    question, fetch_reason,
-                )
-                memory.add_user(question)
-                memory.add_assistant(answer)
-                return answer
+                # ── Pre-fetch causal filter (因果裁斷過濾) ──────────────────
+                # Before forwarding the query to an external service (Wikipedia),
+                # run a content-based safety check through ValuePruner so that
+                # dangerous queries never leave the system boundary.
+                fetch_safe, fetch_reason = self.agent.pruner.is_query_safe(question)
+                if not fetch_safe:
+                    answer = f"外部資料抓取已遭因果裁斷攔截：{fetch_reason}"
+                    logger.warning(
+                        "[KnowledgeModule] 因果裁斷攔截外部查詢：%s | %s",
+                        question, fetch_reason,
+                    )
+                else:
+                    # ── Tier 2: Wikipedia encyclopedic fallback ──────────────
+                    # When local knowledge has no match, consult the free
+                    # encyclopedic knowledge base (Wikipedia) as an authoritative
+                    # secondary source.
+                    wiki_result = self._wiki.search(question)
+                    if wiki_result:
+                        answer = f"[百科知識 · Wikipedia] {wiki_result}"
+                        logger.info("[KnowledgeModule] Wikipedia fallback: %s", question)
+                    else:
+                        answer = (
+                            "無私人知識資料，維基百科亦未找到相符條目。"
+                            "請主公提供來源或自行查閱權威機構。"
+                        )
 
-            # ── Tier 2: Wikipedia encyclopedic fallback ─────────────────────
-            # When local knowledge has no match, consult the free encyclopedic
-            # knowledge base (Wikipedia) as an authoritative secondary source.
-            wiki_result = self._wiki.search(question)
-            if wiki_result:
-                answer = f"[百科知識 · Wikipedia] {wiki_result}"
-                logger.info("[KnowledgeModule] Wikipedia fallback: %s", question)
-            else:
-                answer = (
-                    "無私人知識資料，維基百科亦未找到相符條目。"
-                    "請主公提供來源或自行查閱權威機構。"
-                )
-
-        # ── 5. Persist to conversation memory ───────────────────────────────
+        # ── 5. Persist to conversation memory (exactly once) ────────────────
         memory.add_user(question)
         memory.add_assistant(answer, topic=_KEY_TO_TOPIC.get(matched_key, ""))
         return answer
