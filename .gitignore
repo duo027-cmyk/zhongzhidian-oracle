@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+
+# Generated runtime files — should not be committed
+conversation_history.json
+training_rewards.png
+*.pth
+.pytest_cache/
