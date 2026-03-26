@@ -282,7 +282,7 @@ class ValuePruner:
         """
         q_lower = query.lower()
         for kw in self.danger_keywords:
-            if kw in q_lower:
+            if kw.lower() in q_lower:
                 return False, f"查詢觸發危險關鍵字「{kw}」，拒絕抓取外部資料"
         return True, "查詢通過因果裁斷，允許抓取外部資料"
 
@@ -582,9 +582,11 @@ class WikipediaAdapter:
         self.lang: str = _WIKI_LANG
         self.timeout: int = _WIKI_TIMEOUT
         self.enabled: bool = _WIKI_ENABLED
-        # LRU cache: key = "{lang}:{query}", value = summary string
-        self._cache: dict = {}
-        self._cache_order: collections.deque = collections.deque(maxlen=_WIKI_CACHE_MAX)
+        # True LRU cache backed by OrderedDict.
+        # Key = "{lang}:{query}", value = summary string.
+        # On every cache *hit* the entry is moved to the end (most-recently-used).
+        # On insertion when full, the *first* entry (least-recently-used) is evicted.
+        self._cache: collections.OrderedDict = collections.OrderedDict()
 
     # ── Public ────────────────────────────────────────────────────────────
 
@@ -592,7 +594,7 @@ class WikipediaAdapter:
         """Return a short encyclopedic summary for *query*, or ``None``.
 
         Steps:
-        1. Check in-process LRU cache.
+        1. Check in-process LRU cache (hit refreshes recency).
         2. OpenSearch to resolve the best matching article title.
         3. REST ``page/summary`` endpoint to fetch the extract.
         4. If the primary language yields no result, try English as fallback.
@@ -602,6 +604,7 @@ class WikipediaAdapter:
         cache_key = f"{self.lang}:{query}"
         if cache_key in self._cache:
             logger.debug("[WikipediaAdapter] Cache hit: %s", query)
+            self._cache.move_to_end(cache_key)   # refresh recency
             return self._cache[cache_key]
 
         result = self._fetch_summary(query, self.lang)
@@ -662,14 +665,12 @@ class WikipediaAdapter:
             return None
 
     def _put_cache(self, key: str, value: str) -> None:
-        """Insert *key*→*value* into the LRU cache, evicting the oldest if full."""
-        if key not in self._cache:
-            # deque with maxlen handles eviction automatically;
-            # we only need to remove the corresponding dict entry.
-            if len(self._cache_order) == _WIKI_CACHE_MAX:
-                oldest = self._cache_order[0]   # will be auto-evicted from deque
-                self._cache.pop(oldest, None)
-            self._cache_order.append(key)
+        """Insert *key*→*value* into the LRU cache, evicting the LRU entry if full."""
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        else:
+            if len(self._cache) >= _WIKI_CACHE_MAX:
+                self._cache.popitem(last=False)   # evict least-recently-used
         self._cache[key] = value
 
 
@@ -771,7 +772,7 @@ class KnowledgeModule:
            ``ValuePruner.is_query_safe`` — dangerous queries are rejected
            before any external network request leaves the system boundary.
         5. If query passes the filter: Wikipedia encyclopedic fallback (Tier 2).
-        6. Record the Q&A pair into the shared ``ConversationMemory``.
+        6. Record the Q&A pair into the shared ``ConversationMemory`` exactly once.
         """
         memory: ConversationMemory = self.agent.conversation
 
@@ -855,24 +856,22 @@ class KnowledgeModule:
                     "[KnowledgeModule] 因果裁斷攔截外部查詢：%s | %s",
                     question, fetch_reason,
                 )
-                memory.add_user(question)
-                memory.add_assistant(answer)
-                return answer
-
-            # ── Tier 2: Wikipedia encyclopedic fallback ─────────────────────
-            # When local knowledge has no match, consult the free encyclopedic
-            # knowledge base (Wikipedia) as an authoritative secondary source.
-            wiki_result = self._wiki.search(question)
-            if wiki_result:
-                answer = f"[百科知識 · Wikipedia] {wiki_result}"
-                logger.info("[KnowledgeModule] Wikipedia fallback: %s", question)
             else:
-                answer = (
-                    "無私人知識資料，維基百科亦未找到相符條目。"
-                    "請主公提供來源或自行查閱權威機構。"
-                )
+                # ── Tier 2: Wikipedia encyclopedic fallback ─────────────────
+                # When local knowledge has no match, consult the free
+                # encyclopedic knowledge base (Wikipedia) as an authoritative
+                # secondary source.
+                wiki_result = self._wiki.search(question)
+                if wiki_result:
+                    answer = f"[百科知識 · Wikipedia] {wiki_result}"
+                    logger.info("[KnowledgeModule] Wikipedia fallback: %s", question)
+                else:
+                    answer = (
+                        "無私人知識資料，維基百科亦未找到相符條目。"
+                        "請主公提供來源或自行查閱權威機構。"
+                    )
 
-        # ── 5. Persist to conversation memory ───────────────────────────────
+        # ── 5. Persist to conversation memory (exactly once per query) ───────
         memory.add_user(question)
         memory.add_assistant(answer, topic=_KEY_TO_TOPIC.get(matched_key, ""))
         return answer

@@ -13,6 +13,9 @@ Covers the fixes introduced in the "請針對問題優化修正到完美" PR:
   9. Agent.chat() auto-saves conversation history
  10. WikipediaAdapter — encyclopedic fallback (mocked network)
  11. KnowledgeModule Wikipedia Tier 2 fallback
+ 12. is_query_safe() keyword case-normalisation fix (follow-up PR)
+ 13. WikipediaAdapter true LRU cache (hit refreshes recency) (follow-up PR)
+ 14. KnowledgeModule memory persistence — exactly one Q&A pair per query (follow-up PR)
 """
 
 import hashlib
@@ -658,3 +661,143 @@ class TestPreFetchCausalFilter:
         answer = agent.chat("光合作用是什麼")
         km._wiki.search.assert_called_once()
         assert "Wikipedia" in answer or "百科" in answer
+
+
+# ============================================================================
+# 12. IS_QUERY_SAFE KEYWORD CASE-NORMALISATION (follow-up PR)
+# ============================================================================
+
+class TestIsQuerySafeCaseNormalisation:
+    """Ensure is_query_safe() lowercases keywords before comparing."""
+
+    def test_uppercase_english_keyword_in_query(self):
+        """HARM (all-caps) in query must be caught."""
+        pruner = dsv.ValuePruner()
+        safe, reason = pruner.is_query_safe("HARM everyone now")
+        assert safe is False
+        assert "harm" in reason.lower()
+
+    def test_mixed_case_english_keyword_in_query(self):
+        """Mixed-case keyword (Kill) must be caught."""
+        pruner = dsv.ValuePruner()
+        safe, reason = pruner.is_query_safe("How to Kill a process")
+        assert safe is False
+        assert "kill" in reason.lower()
+
+    def test_safe_query_passes(self):
+        """An unrelated query must still pass the filter."""
+        pruner = dsv.ValuePruner()
+        safe, _ = pruner.is_query_safe("What is photosynthesis?")
+        assert safe is True
+
+
+# ============================================================================
+# 13. WIKIPEDIA ADAPTER TRUE LRU CACHE (follow-up PR)
+# ============================================================================
+
+class TestWikipediaAdapterLRU:
+    """Verify that cache hits refresh recency and eviction is LRU, not FIFO."""
+
+    def test_cache_hit_refreshes_recency(self):
+        """After a hit on key A, filling the cache evicts B (LRU), not A."""
+        import dreamer_sovereign_v7_6 as _dsv
+        orig = _dsv._WIKI_CACHE_MAX
+        _dsv._WIKI_CACHE_MAX = 2
+        try:
+            adapter = dsv.WikipediaAdapter()
+            # Manually seed the OrderedDict cache to avoid network calls
+            adapter._put_cache("zh:A", "summary_A")
+            adapter._put_cache("zh:B", "summary_B")
+            # Hit A — moves A to the end (most-recently-used)
+            adapter._cache.move_to_end("zh:A")
+            # Insert C — should evict B (the new LRU), not A
+            adapter._put_cache("zh:C", "summary_C")
+            assert "zh:A" in adapter._cache, "A should still be in cache (recently used)"
+            assert "zh:B" not in adapter._cache, "B should have been evicted (LRU)"
+            assert "zh:C" in adapter._cache
+        finally:
+            _dsv._WIKI_CACHE_MAX = orig
+
+    def test_put_cache_evicts_oldest_when_full(self):
+        """When cache is full, the least-recently-used entry is evicted."""
+        import dreamer_sovereign_v7_6 as _dsv
+        orig = _dsv._WIKI_CACHE_MAX
+        _dsv._WIKI_CACHE_MAX = 2
+        try:
+            adapter = dsv.WikipediaAdapter()
+            adapter._put_cache("zh:first", "v1")
+            adapter._put_cache("zh:second", "v2")
+            # Cache is full; inserting third must evict 'first' (LRU)
+            adapter._put_cache("zh:third", "v3")
+            assert "zh:first" not in adapter._cache
+            assert "zh:second" in adapter._cache
+            assert "zh:third" in adapter._cache
+        finally:
+            _dsv._WIKI_CACHE_MAX = orig
+
+    def test_search_hit_does_not_make_network_call(self):
+        """A cache hit via search() must refresh recency and skip network."""
+        adapter = dsv.WikipediaAdapter()
+        cache_key = f"{adapter.lang}:台灣"
+        adapter._cache[cache_key] = "cached_summary"
+        with patch("urllib.request.urlopen") as mock_open:
+            result = adapter.search("台灣")
+        mock_open.assert_not_called()
+        assert result == "cached_summary"
+        # After the hit the key must still be present (moved_to_end internally)
+        assert cache_key in adapter._cache
+
+
+# ============================================================================
+# 14. KNOWLEDGE MODULE MEMORY — EXACTLY ONE Q&A PAIR PER QUERY (follow-up PR)
+# ============================================================================
+
+class TestKnowledgeModuleMemoryNormalisation:
+    """Ensure each agent.chat() records exactly one user+assistant pair."""
+
+    def test_dangerous_query_records_exactly_one_pair(self):
+        """Causal-filter rejection must produce exactly one user+assistant entry."""
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km._wiki = MagicMock(spec=dsv.WikipediaAdapter)
+        before = len(agent.conversation.get_history())
+        agent.chat("殺人方法是什麼")
+        after = len(agent.conversation.get_history())
+        # Exactly two new entries: one user, one assistant
+        assert after - before == 2, (
+            f"Expected 2 new history entries, got {after - before}"
+        )
+
+    def test_safe_unknown_query_records_exactly_one_pair(self):
+        """Wikipedia fallback must also produce exactly one user+assistant entry."""
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km._wiki = MagicMock(spec=dsv.WikipediaAdapter)
+        km._wiki.search.return_value = "Wiki summary"
+        before = len(agent.conversation.get_history())
+        agent.chat("光合作用是什麼")
+        after = len(agent.conversation.get_history())
+        assert after - before == 2, (
+            f"Expected 2 new history entries, got {after - before}"
+        )
+
+    def test_known_query_records_exactly_one_pair(self):
+        """A local KB hit must also produce exactly one user+assistant entry."""
+        agent = make_agent()
+        before = len(agent.conversation.get_history())
+        agent.chat("相對論是什麼？")
+        after = len(agent.conversation.get_history())
+        assert after - before == 2, (
+            f"Expected 2 new history entries, got {after - before}"
+        )
+
+    def test_agent_chat_autosaves_after_dangerous_query(self, tmp_path, monkeypatch):
+        """Agent.chat() must still auto-save after a causal-filter rejection."""
+        import dreamer_sovereign_v7_6 as _dsv
+        path = str(tmp_path / "session.json")
+        monkeypatch.setattr(_dsv, "_CONVERSATION_PATH", path)
+        agent = make_agent()
+        km: dsv.KnowledgeModule = agent.modules["knowledge"]
+        km._wiki = MagicMock(spec=dsv.WikipediaAdapter)
+        agent.chat("殺人方法是什麼")
+        assert os.path.exists(path), "History file must be written after dangerous query"
